@@ -1,21 +1,38 @@
-"""Ticket #4 — Web search tool wrapper."""
+"""Ticket #4 / ADR-0010 — Web search tool wrapper.
+
+Wraps ``dashscope.Application.call`` (a Bailian single-agent application
+with a web-search plugin) and projects ``pages[0]`` of its structured
+output into the canonical ``SearchResult``. Tests ``monkeypatch`` the
+module-level ``dashscope.Application.call`` so no real network call
+happens, then assert the ``app_id`` comes from config and the nested
+``output.text`` JSON is parsed correctly.
+"""
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 
-def _make_fake_response(content: str) -> MagicMock:
+def _make_fake_response(pages: list[dict]) -> MagicMock:
+    """Build a stub ``dashscope.Application.call`` return value.
+
+    The real Bailian response wraps the agent's JSON twice:
+      output.text = '{"result":{"content":[{"text":"<inner>"}]}}'
+      <inner>     = '{"pages":[{"url":...,"title":...,"snippet":...}]}'
+    """
+    inner = json.dumps({"pages": pages})
+    outer = json.dumps({"result": {"content": [{"text": inner}]}})
     resp = MagicMock()
-    resp.choices = [MagicMock()]
-    resp.choices[0].message.content = content
+    resp.output = MagicMock()
+    resp.output.text = outer
     return resp
 
 
-def test_web_search_sends_enable_search_true(monkeypatch) -> None:
-    """Tool must call the DashScope-compatible client with enable_search=True."""
+def test_web_search_calls_bailian_app_with_configured_app_id(monkeypatch) -> None:
+    """Tool must call ``dashscope.Application.call`` with the configured app_id."""
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-XYZ")
-    monkeypatch.setenv("DASHSCOPE_BASE_URL", "https://example.com/compatible-mode/v1")
+    monkeypatch.setenv("DASHSCOPE_MCP_APP_ID", "app-abc")
 
     from app.config import get_config
     from app.tools import web_search
@@ -24,72 +41,66 @@ def test_web_search_sends_enable_search_true(monkeypatch) -> None:
 
     captured: dict = {}
 
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            captured.update(kwargs)
-            return _make_fake_response(
-                '{"url": "https://x.test/a", "title": "Hello", "snippet": "world", "score": 0.8}'
-            )
+    def _fake_call(**kwargs):
+        captured.update(kwargs)
+        return _make_fake_response(
+            [
+                {
+                    "url": "https://x.test/a",
+                    "title": "Hello",
+                    "snippet": "world",
+                    "hostname": "x.test",
+                    "hostlogo": "",
+                }
+            ]
+        )
 
-    class _FakeClient:
-        def __init__(self, **kwargs) -> None:
-            captured["client_kwargs"] = kwargs
-            self.chat = MagicMock()
-            self.chat.completions = _FakeCompletions()
-
-    with patch("app.tools.web_search.OpenAI", _FakeClient):
+    with patch("app.tools.web_search.dashscope.Application.call", _fake_call):
         result = web_search.web_search.invoke({"query": "what is X?", "topic_id": "topic-1"})
 
-    assert captured["client_kwargs"]["base_url"] == "https://example.com/compatible-mode/v1"
-    assert captured["client_kwargs"]["api_key"] == "dashscope-XYZ"
-    assert captured["extra_body"] == {"enable_search": True}
-    assert captured["model"]  # some default model is set
-    # Response parsed to SearchResult dict
+    assert captured["app_id"] == "app-abc"
+    assert captured["prompt"] == "what is X?"
+    # Projected to SearchResult: topic_id threaded through, score defaults to None
     assert result["topic_id"] == "topic-1"
     assert result["url"] == "https://x.test/a"
     assert result["title"] == "Hello"
     assert result["snippet"] == "world"
-    assert result["score"] == 0.8
+    assert result["score"] is None
 
 
-def test_web_search_strips_markdown_fences(monkeypatch) -> None:
+def test_web_search_dashscope_api_key_is_set_from_config(monkeypatch) -> None:
+    """The tool must seed ``dashscope.api_key`` from the configured DashScope key."""
     monkeypatch.setenv("DASHSCOPE_API_KEY", "dashscope-XYZ")
+    monkeypatch.setenv("DASHSCOPE_MCP_APP_ID", "app-abc")
 
     from app.config import get_config
     from app.tools import web_search
 
     get_config.cache_clear()
 
-    class _FakeCompletions:
-        def create(self, **kwargs):
-            return _make_fake_response(
-                "```json\n"
-                '{"url": "https://x.test/b", "title": "Fenced", "snippet": "ok", "score": 0.5}\n'
-                "```"
-            )
+    def _fake_call(**kwargs):
+        return _make_fake_response(
+            [{"url": "https://x.test/a", "title": "t", "snippet": "s", "hostname": "x", "hostlogo": ""}]
+        )
 
-    class _FakeClient:
-        def __init__(self, **kwargs) -> None:
-            self.chat = MagicMock()
-            self.chat.completions = _FakeCompletions()
+    with patch("app.tools.web_search.dashscope.Application.call", _fake_call):
+        web_search.web_search.invoke({"query": "q", "topic_id": "topic-2"})
 
-    with patch("app.tools.web_search.OpenAI", _FakeClient):
-        result = web_search.web_search.invoke({"query": "q", "topic_id": "topic-2"})
-
-    assert result["title"] == "Fenced"
-    assert result["topic_id"] == "topic-2"
+    assert web_search.dashscope.api_key == "dashscope-XYZ"
 
 
 def test_web_search_no_real_call_during_import(monkeypatch) -> None:
-    """Importing the module must not instantiate an OpenAI client."""
+    """Importing the module must not invoke ``dashscope.Application.call``."""
     monkeypatch.setenv("DASHSCOPE_API_KEY", "any")
+    monkeypatch.setenv("DASHSCOPE_MCP_APP_ID", "any")
 
-    class _BoomClient:
-        def __init__(self, **kwargs) -> None:
-            raise AssertionError("OpenAI client must not be instantiated at import time")
+    def _boom_call(**kwargs):
+        raise AssertionError(
+            "dashscope.Application.call must not be invoked at import time"
+        )
 
-    with patch("app.tools.web_search.OpenAI", _BoomClient):
-        # Reloading triggers re-import; should not call OpenAI.
+    with patch("app.tools.web_search.dashscope.Application.call", _boom_call):
+        # Reloading triggers re-import; should not call Application.call.
         import importlib
 
         from app.tools import web_search as mod

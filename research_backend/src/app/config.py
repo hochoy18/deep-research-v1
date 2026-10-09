@@ -29,6 +29,7 @@ class Config:
 
     dashscope_api_key: str
     dashscope_base_url: str
+    dashscope_mcp_app_id: str
 
     redis_url: str
 
@@ -63,6 +64,7 @@ def get_config() -> Config:
         dashscope_base_url=_getenv(
             "DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ),
+        dashscope_mcp_app_id=_getenv("DASHSCOPE_MCP_APP_ID", ""),
         redis_url=_getenv("REDIS_URL", "redis://localhost:6379"),
         log_level=_getenv("LOG_LEVEL", "INFO"),
     )

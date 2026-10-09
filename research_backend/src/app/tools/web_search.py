@@ -1,10 +1,16 @@
-"""Web search tool wrapper (ticket #4).
+"""Web search tool wrapper (ticket #4 / ADR-0010).
 
-Wraps DashScope's OpenAI-compatible chat completion endpoint with
-``extra_body={"enable_search": True}`` as a ``DynamicStructuredTool``. This is
-the single boundary every node uses to issue a web search — tests
-``monkeypatch`` the underlying ``openai.OpenAI`` constructor and capture the
-payload to assert it carried ``enable_search=True`` without hitting the real API.
+Wraps ``dashscope.Application.call`` against a Bailian single-agent
+application (configured server-side with a web-search plugin). The app
+returns a structured double-wrapped JSON::
+
+    output.text = '{"result":{"content":[{"text":"<inner>"}]}}'
+    <inner>     = '{"pages":[{"snippet","hostname","hostlogo","title","url"}, ...]}'
+
+We project ``pages[0]`` into the canonical ``SearchResult``. Tests
+``monkeypatch`` ``app.tools.web_search.dashscope.Application.call`` and
+capture the kwargs to assert the configured ``app_id`` is used without
+hitting the real DashScope endpoint.
 """
 
 from __future__ import annotations
@@ -12,14 +18,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import dashscope
 from langchain_core.tools import StructuredTool
-from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from app.config import get_config
 from app.models import SearchResult
-
-DEFAULT_SEARCH_MODEL = "qwen-plus"
 
 
 class WebSearchInput(BaseModel):
@@ -29,58 +33,43 @@ class WebSearchInput(BaseModel):
     topic_id: str = Field(..., description="Owning ResearchTopic.id for grouping")
 
 
-def _extract_message_content(response: Any) -> str:
-    """Pull the text content out of a DashScope/OpenAI chat completion response."""
-    try:
-        return response.choices[0].message.content or ""
-    except (AttributeError, IndexError, KeyError) as exc:
-        raise RuntimeError(f"Unexpected search response shape: {response!r}") from exc
-
-
 def _run_web_search(query: str, topic_id: str) -> dict:
-    """Call DashScope with ``enable_search=True`` and parse the first message.
+    """Call the Bailian single-agent app and project ``pages[0]`` to ``SearchResult``.
 
     Returns a dict matching ``SearchResult`` so ``DynamicStructuredTool`` can
     type-validate the tool output before returning to the agent.
     """
     cfg = get_config()
-    client = OpenAI(api_key=cfg.dashscope_api_key, base_url=cfg.dashscope_base_url)
+    dashscope.api_key = cfg.dashscope_api_key
 
-    response = client.chat.completions.create(
-        model=DEFAULT_SEARCH_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a web search assistant. When the user asks a "
-                    "question, run a web search and respond with a JSON object "
-                    "of the form "
-                    '{"url": "...", "title": "...", "snippet": "...", "score": 0.0}.'
-                ),
-            },
-            {"role": "user", "content": query},
-        ],
-        extra_body={"enable_search": True},
+    response = dashscope.Application.call(
+        app_id=cfg.dashscope_mcp_app_id,
+        prompt=query,
     )
 
-    raw = _extract_message_content(response).strip()
-
-    # DashScope sometimes wraps the JSON in markdown code fences; strip them.
-    if raw.startswith("```"):
-        raw = raw.strip("`").removeprefix("json").strip()
+    outer_text: str | None = getattr(getattr(response, "output", None), "text", None)
+    if outer_text is None:
+        raise RuntimeError(f"Unexpected Bailian response shape: {response!r}")
 
     try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
+        outer = json.loads(outer_text)
+        inner = json.loads(outer["result"]["content"][0]["text"])
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(
-            f"Search response was not valid JSON: {raw!r}"
+            f"Unexpected Bailian response outer shape: {outer_text!r}"
         ) from exc
 
-    payload.setdefault("score", None)
-    payload["topic_id"] = topic_id
+    pages: list[dict[str, Any]] = inner.get("pages") or []
+    if not pages:
+        raise RuntimeError(f"Bailian returned no pages: {outer_text!r}")
 
-    # Validate through the Pydantic schema so downstream code can trust the shape.
-    return SearchResult(**payload).model_dump()
+    page = pages[0]
+    return SearchResult(
+        topic_id=topic_id,
+        url=page["url"],
+        title=page["title"],
+        snippet=page["snippet"],
+    ).model_dump()
 
 
 # A single module-level instance accessed via ``get_web_search()``. We hide
@@ -90,8 +79,8 @@ def _run_web_search(query: str, topic_id: str) -> dict:
 web_search = StructuredTool(
     name="web_search",
     description=(
-        "Issue a web search via DashScope and return a single best-result "
-        "SearchResult (url, title, snippet, score)."
+        "Issue a web search via the configured Bailian single-agent application "
+        "and return the first page's url / title / snippet."
     ),
     func=_run_web_search,
     args_schema=WebSearchInput,

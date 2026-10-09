@@ -42,7 +42,8 @@ def research_run(state: State, config: RunnableConfig) -> dict:
         payload = search_module.get_web_search().invoke(
             {"query": _format_query(topic), "topic_id": topic.id}
         )
-        results.append(SearchResult(**payload))
+        # ``web_search`` returns one SearchResult per Bailian page (typically ~5).
+        results.extend(SearchResult(**p) for p in payload)
 
     return {
         "search_results": results,

@@ -20,14 +20,17 @@ from app.models import SearchResult
 from app.tools.web_search import get_web_search
 from rich import print as rprint
 
-QUERY = "Python 3.13 release notes"
+QUERY = "调研欧美国家 酒店行业 在AI Agent 的落地使用"
 TOPIC_ID = "topic-1"
 
 raw = get_web_search().invoke({"query": QUERY, "topic_id": TOPIC_ID})
 rprint(raw)
 
+# The tool returns one SearchResult per Bailian page (typically ~5).
 # Validate through the same Pydantic model the production code uses.
-parsed = SearchResult(**raw)
-assert parsed.url, f"search returned empty url: {raw!r}"
-assert parsed.title, f"search returned empty title: {raw!r}"
-print(f"\nOK: {parsed.title} — {parsed.url}")
+parsed = [SearchResult(**p) for p in raw]
+assert parsed, f"search returned no pages: {raw!r}"
+for p in parsed:
+    assert p.url, f"search returned empty url: {p!r}"
+    assert p.title, f"search returned empty title: {p!r}"
+print(f"\nOK: {len(parsed)} pages — {parsed[0].title} — {parsed[0].url}")

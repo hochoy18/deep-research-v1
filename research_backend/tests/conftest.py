@@ -89,13 +89,19 @@ def fake_search_tool(monkeypatch):
         def invoke(self, payload, **_kwargs):
             self.calls.append(payload)
             topic_id = payload["topic_id"]
-            return {
-                "topic_id": topic_id,
-                "url": f"https://example.com/{topic_id}",
-                "title": f"Mock result for {topic_id}",
-                "snippet": "A canned snippet.",
-                "score": 0.9,
-            }
+            # Match production contract: ``web_search`` returns a list with one
+            # SearchResult-shaped dict per Bailian page. Stub returns a single
+            # page; tests should account for this with ``len(...) == N`` where
+            # N = pages-per-call * topics.
+            return [
+                {
+                    "topic_id": topic_id,
+                    "url": f"https://example.com/{topic_id}",
+                    "title": f"Mock result for {topic_id}",
+                    "snippet": "A canned snippet.",
+                    "score": 0.9,
+                }
+            ]
 
     stub = _StubTool()
     monkeypatch.setattr(web_search, "get_web_search", lambda: stub)

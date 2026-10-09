@@ -63,13 +63,15 @@ def test_graph_invoke_end_to_end(monkeypatch, memory_checkpointer) -> None:
         def invoke(self, payload, **_kwargs):
             self.calls.append(payload)
             topic_id = payload["topic_id"]
-            return {
-                "topic_id": topic_id,
-                "url": f"https://example.com/{topic_id}",
-                "title": f"Mock result {topic_id}",
-                "snippet": "snippet",
-                "score": 0.9,
-            }
+            return [
+                {
+                    "topic_id": topic_id,
+                    "url": f"https://example.com/{topic_id}",
+                    "title": f"Mock result {topic_id}",
+                    "snippet": "snippet",
+                    "score": 0.9,
+                }
+            ]
 
     stub_search = _StubSearch()
     monkeypatch.setattr(web_search, "get_web_search", lambda: stub_search)

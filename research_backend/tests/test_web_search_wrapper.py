@@ -1,7 +1,7 @@
 """Ticket #4 / ADR-0010 — Web search tool wrapper.
 
 Wraps ``dashscope.Application.call`` (a Bailian single-agent application
-with a web-search plugin) and projects ``pages[0]`` of its structured
+with a web-search plugin) and projects every page of its structured
 output into the canonical ``SearchResult``. Tests ``monkeypatch`` the
 module-level ``dashscope.Application.call`` so no real network call
 happens, then assert the ``app_id`` comes from config and the nested
@@ -60,12 +60,15 @@ def test_web_search_calls_bailian_app_with_configured_app_id(monkeypatch) -> Non
 
     assert captured["app_id"] == "app-abc"
     assert captured["prompt"] == "what is X?"
-    # Projected to SearchResult: topic_id threaded through, score defaults to None
-    assert result["topic_id"] == "topic-1"
-    assert result["url"] == "https://x.test/a"
-    assert result["title"] == "Hello"
-    assert result["snippet"] == "world"
-    assert result["score"] is None
+    # Tool returns one SearchResult-shaped dict per Bailian page.
+    assert isinstance(result, list)
+    assert len(result) == 1
+    page = result[0]
+    assert page["topic_id"] == "topic-1"
+    assert page["url"] == "https://x.test/a"
+    assert page["title"] == "Hello"
+    assert page["snippet"] == "world"
+    assert page["score"] is None
 
 
 def test_web_search_dashscope_api_key_is_set_from_config(monkeypatch) -> None:

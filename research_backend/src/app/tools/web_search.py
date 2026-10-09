@@ -7,9 +7,10 @@ returns a structured double-wrapped JSON::
     output.text = '{"result":{"content":[{"text":"<inner>"}]}}'
     <inner>     = '{"pages":[{"snippet","hostname","hostlogo","title","url"}, ...]}'
 
-We project ``pages[0]`` into the canonical ``SearchResult``. Tests
-``monkeypatch`` ``app.tools.web_search.dashscope.Application.call`` and
-capture the kwargs to assert the configured ``app_id`` is used without
+We project **every** page into a ``SearchResult`` and return the full list
+(``pages[0]`` would discard the rest — Bailian returns ~5 per query).
+Tests ``monkeypatch`` ``app.tools.web_search.dashscope.Application.call``
+and capture the kwargs to assert the configured ``app_id`` is used without
 hitting the real DashScope endpoint.
 """
 
@@ -33,11 +34,11 @@ class WebSearchInput(BaseModel):
     topic_id: str = Field(..., description="Owning ResearchTopic.id for grouping")
 
 
-def _run_web_search(query: str, topic_id: str) -> dict:
-    """Call the Bailian single-agent app and project ``pages[0]`` to ``SearchResult``.
+def _run_web_search(query: str, topic_id: str) -> list[dict]:
+    """Call the Bailian single-agent app and project every page to a ``SearchResult``.
 
-    Returns a dict matching ``SearchResult`` so ``DynamicStructuredTool`` can
-    type-validate the tool output before returning to the agent.
+    Returns a list of ``SearchResult``-shaped dicts (one per page). An empty
+    ``pages`` list raises so callers don't silently get an empty result.
     """
     cfg = get_config()
     dashscope.api_key = cfg.dashscope_api_key
@@ -63,13 +64,15 @@ def _run_web_search(query: str, topic_id: str) -> dict:
     if not pages:
         raise RuntimeError(f"Bailian returned no pages: {outer_text!r}")
 
-    page = pages[0]
-    return SearchResult(
-        topic_id=topic_id,
-        url=page["url"],
-        title=page["title"],
-        snippet=page["snippet"],
-    ).model_dump()
+    return [
+        SearchResult(
+            topic_id=topic_id,
+            url=page["url"],
+            title=page["title"],
+            snippet=page["snippet"],
+        ).model_dump()
+        for page in pages
+    ]
 
 
 # A single module-level instance accessed via ``get_web_search()``. We hide
@@ -80,7 +83,7 @@ web_search = StructuredTool(
     name="web_search",
     description=(
         "Issue a web search via the configured Bailian single-agent application "
-        "and return the first page's url / title / snippet."
+        "and return all pages' url / title / snippet as a list of SearchResult."
     ),
     func=_run_web_search,
     args_schema=WebSearchInput,

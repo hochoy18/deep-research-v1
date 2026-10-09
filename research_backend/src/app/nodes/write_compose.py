@@ -5,8 +5,10 @@ Stage 1 (ticket #6) produces an outline and a draft Markdown body. Stage 2
 markers and appends a ``## References`` section so every cited SearchResult
 appears in the reference list at the bottom.
 
-We split the node into two helpers so stage 1 can be exercised in isolation
-without forcing every test to also build a citation inserter.
+Citation scope: one ``[N]`` per section, placed at the end of the section
+body. The deterministic inserter has no per-claim source mapping, so the
+section is sourced by ``[N]`` as a whole. Per-claim citation belongs to
+the v0.4 reviewer (see ADR-0007).
 """
 
 from __future__ import annotations
@@ -111,21 +113,17 @@ def _ensure_blank_line_before_references(body: str) -> str:
     return body
 
 
-_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+def _append_section_citation(section_body: str, marker: str) -> str:
+    """Append the ``[N]`` marker once at the end of ``section_body``.
 
-
-def _insert_reference_marker_per_sentence(section_body: str, marker: str) -> str:
-    """Append ``[N]`` after every sentence in ``section_body``.
-
-    Splits on sentence-ending punctuation (``.``, ``!``, ``?``) so each factual
-    claim carries its own inline citation.
+    One marker per section because the deterministic inserter has no
+    per-claim source mapping — the section as a whole is sourced by
+    ``[N]``. Per-claim citation is the v0.4 reviewer's job (ADR-0007).
     """
     section_body = section_body.rstrip()
     if not section_body:
         return f" {marker}"
-    sentences = _SENTENCE_END_RE.split(section_body)
-    annotated = [f"{s.rstrip()} {marker}" for s in sentences if s.strip()]
-    return " ".join(annotated)
+    return f"{section_body} {marker}"
 
 
 def _assign_citation_marker(
@@ -179,7 +177,7 @@ def compose_report(state: State) -> dict:
     for i, (heading, body) in enumerate(bodies):
         marker = _assign_citation_marker(i, search_results, ref_index, topics_index)
         if marker is not None:
-            body = _insert_reference_marker_per_sentence(body, marker)
+            body = _append_section_citation(body, marker)
         rendered.append(f"## {heading}\n\n{body}".rstrip())
 
     body_with_references = _ensure_blank_line_before_references("\n\n".join(rendered))

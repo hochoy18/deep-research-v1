@@ -50,6 +50,30 @@ def test_stage2_appends_inline_citations() -> None:
     assert final.count("[2]") >= 1
 
 
+def test_stage2_cites_section_once_not_per_sentence() -> None:
+    """Regression for Spec #8 — a section is sourced by [N] as a whole.
+
+    The deterministic inserter has no per-claim source mapping, so each
+    section must receive exactly one [N] marker, placed at the end of
+    the section body. Stamping the same [N] on every sentence falsely
+    claims each sentence is independently backed by the same single
+    source.
+    """
+    state = _state()
+    # Strip the multi-sentence body in section 1 down to three sentences.
+    state["draft"] = (
+        "Intro paragraph.\n\n"
+        "## Background\n\n"
+        "First factual claim. Second factual claim. Third factual claim."
+    )
+    delta = compose_report(state)
+    final = delta["report"]
+    bg = final.split("## Background", 1)[1].split("## References", 1)[0]
+    assert bg.count("[1]") == 1, (
+        f"expected 1 inline citation per section, got {bg.count('[1]')}"
+    )
+
+
 def test_stage2_appends_references_section() -> None:
     delta = compose_report(_state())
     final = delta["report"]

@@ -1,9 +1,13 @@
-"""Configuration loaded from environment variables.
+"""Configuration loaded from environment variables (and ``.env``).
 
-Per user story #14, we deliberately avoid `pydantic-settings` to keep the
-dependency surface minimal. Every read goes through `os.getenv` and is wrapped
-by `get_config()` which caches the result so tests can `monkeypatch.setenv`
-*before* the first call.
+Reads go through ``os.getenv`` and are wrapped by ``get_config()`` which
+loads ``.env`` once on first call (via ``python-dotenv``) and caches the
+result so tests can ``monkeypatch.setenv`` *before* the first call.
+
+``load_dotenv(override=False)`` is intentional: env vars already set in
+the process (e.g. by ``conftest.py`` or a shell) win over ``.env``. This
+lets tests seed fake values without a real ``.env`` shadowing them, and
+lets production deploys override ``.env`` via the environment.
 """
 
 from __future__ import annotations
@@ -11,6 +15,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from functools import lru_cache
+
+from dotenv import load_dotenv
 
 
 @dataclass(frozen=True)
@@ -41,11 +47,14 @@ def _getenv(name: str, default: str | None = None) -> str:
 
 @lru_cache(maxsize=1)
 def get_config() -> Config:
-    """Read configuration from the environment.
+    """Read configuration from ``.env`` (first call only) then the environment.
 
-    Cached for the lifetime of the process — tests should call
+    ``.env`` is loaded lazily on the first call via ``load_dotenv`` with
+    ``override=False``, so already-set env vars (tests, shell) win. Cached
+    for the lifetime of the process — tests should call
     ``get_config.cache_clear()`` after ``monkeypatch.setenv`` to pick up changes.
     """
+    load_dotenv(override=False)
     return Config(
         openai_api_key=_getenv("OPENAI_API_KEY", ""),
         openai_base_url=_getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),

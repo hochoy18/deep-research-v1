@@ -16,10 +16,18 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379")
 
 
 @pytest.fixture(autouse=True)
-def _reset_config_cache() -> Iterator[None]:
-    """``get_config`` is ``lru_cache``d; clear between tests so env patches stick."""
+def _reset_config_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``get_config`` is ``lru_cache``d; clear between tests so env patches stick.
+
+    Also noop ``load_dotenv`` so tests never read the project's real
+    ``.env`` — that would override ``setdefault`` values and (worse) leak
+    real credentials into test assertions. ``test_config.py`` re-enables
+    the call with its own ``monkeypatch.setattr`` to verify the contract.
+    """
+    from app import config
     from app.config import get_config
 
+    monkeypatch.setattr(config, "load_dotenv", lambda **kwargs: None)
     get_config.cache_clear()
     yield
     get_config.cache_clear()

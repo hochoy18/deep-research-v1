@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class ResearchTopic(BaseModel):
-    """A single sub-question carved out of the user's overall query."""
+    """A single Topic carved out of the user_query."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -63,7 +63,7 @@ class Reference(BaseModel):
 
     id: int = Field(..., description="1-based reference number, used as `[N]` in body")
     title: str = Field(..., description="Title of the source")
-    url: str = Field(..., description="URL of the source")
+    url: str = Field(..., description="URL of the reference")
 
 
 class SearchResultsByTopic(BaseModel):

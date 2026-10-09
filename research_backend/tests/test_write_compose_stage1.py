@@ -1,4 +1,4 @@
-"""Ticket #6 — Write node stage 1 (outline + draft, NO citations)."""
+"""Ticket #6 — Write node stage 1 (outline + draft, NO reference markers)."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def test_stage1_produces_outline_and_draft(patched_chat_model) -> None:
     assert "## Background" in draft
 
 
-def test_stage1_does_not_insert_citations_or_references(patched_chat_model) -> None:
+def test_stage1_does_not_insert_reference_markers_or_references(patched_chat_model) -> None:
     patched_chat_model.responses.append(
         json.dumps(
             {

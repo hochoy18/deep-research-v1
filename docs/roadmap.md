@@ -19,7 +19,7 @@
 
 | 版本 | 主题 | 落地的 ADR | 阶段交付（用户能看到的） |
 |---|---|---|---|
-| **v0.1 Foundation** | 项目骨架 + 单轮 happy path | 0001、0002、0003、0008（仅 raise） | `POST /runs` 后拿到 final_report，问题→报告全跑通 |
+| **v0.1 Foundation** | 项目骨架 + 单轮 happy path | 0001、0002、0003、0008（仅 raise） | `POST /runs` 后拿到 Report，问题→报告全跑通 |
 | **v0.2 Plan HITL** | Plan 阶段变成可对话 | 0004、0006（拆子图） | 用户能与 Plan 节点多轮 Q&A，最终拿到 research_plan |
 | **v0.3 Transition gate** | Plan→Research 转换门 | 0005 | 用户在转换门全增删改 topic 后再检索 |
 | **v0.4 Write quality** | 三维评审 + 润色 | 0007 | Draft 不通过就回炉，三维全过才出 final |
@@ -43,13 +43,13 @@
 **代码（`research_backend/src/app/`）**
 - `config.py`：`os.getenv` 直读 OpenAI / DashScope / Redis 配置
 - `models.py`：Pydantic 类型 — `PlanQuestion`、`ResearchTopic`、`SearchResult`、`Outline`、`ReviewNote`、`Reference`
-- `state.py`：全局 TypedDict state（`user_query`、`search_results`、`draft`、`final_report`、`current_step` 等）
+- `state.py`：全局 TypedDict state（`user_query`、`search_results`、`draft`、`report`、`current_step` 等）
 - `tools/llm.py`：`langchain-openai` ChatOpenAI 实例
 - `tools/web_search.py`：DynamicStructuredTool 包装 DashScope `enable_search`
 - `graph.py`：单张 `StateGraph`，节点 `plan_decompose → research_run → write_compose → finalize`
 - `nodes/plan_decompose.py`：LLM 把 user_query 拆成 topic 列表（无 Q&A）
 - `nodes/research_run.py`：每 topic 一次 search，recursion_limit 兜底
-- `nodes/write_compose.py`：Outline → Draft → final_report（行内 `[N]` + 文末 References），不做 review / polish
+- `nodes/write_compose.py`：Outline → Draft → Report（行内 `[N]` + 文末 References），不做 review / polish
 - `api/main.py`：FastAPI app
 - `api/routes.py`：`POST /runs`（创建 thread）、`GET /runs/{id}`（拿 state）、`GET /health`
 
@@ -57,7 +57,7 @@
 - `tests/conftest.py`：`fake_llm` 与 `fake_search` fixture（`monkeypatch` 替换 OpenAI client / DynamicStructuredTool.invoke）
 - `tests/test_plan_decompose.py`：smoke test，输入 mock user_query，验证产出 topic 列表结构
 - `tests/test_research_run.py`：smoke test，输入 mock topics，验证产出 search_results
-- `tests/test_write_compose.py`：smoke test，输入 mock search_results，验证产出 final_report 含 References
+- `tests/test_write_compose.py`：smoke test，输入 mock search_results，验证产出 Report 含 References
 - `tests/test_api_health.py`：FastAPI TestClient 验证 `/health`
 
 **基础设施**
@@ -68,7 +68,7 @@
 
 - `uv run uvicorn app.main:app --reload` 起得来
 - `POST /runs {"user_query": "..."}` 返回 `thread_id`
-- `GET /runs/{thread_id}` 最终 state 包含 `final_report` 字段，是带 `[N]` + References 的 Markdown
+- `GET /runs/{thread_id}` 最终 state 包含 `report` 字段，是带 `[N]` + References 的 Markdown
 - 全 smoke test 通过
 
 ---
@@ -159,13 +159,13 @@
 
 **测试**
 - `tests/test_write_reviewer.py`：mock Draft，验证三维评分逻辑 + 不达阈触发回炉
-- `tests/test_write_polisher.py`：验证 Polish 节点不改变事实（输入 Draft 的事实陈述集合 = 输出 final_report 的事实陈述集合）
+- `tests/test_write_polisher.py`：验证 Polish 节点不改变事实（输入 Draft 的事实陈述集合 = 输出 Report 的事实陈述集合）
 
 ### 验收
 
 - Review 三维中任一维度不通过，Drafter 自动修订
 - 全维度通过后才进入 Polish
-- Polish 后 final_report 仍满足三维 Review（即 Polish 不退化）
+- Polish 后 Report 仍满足三维 Review（即 Polish 不退化）
 
 ---
 
@@ -183,7 +183,7 @@
 - API 层根据 state 返回 4xx / 5xx
 
 **SSE 全事件落地**
-- 8 类事件全部实现：`state_update`、`plan_question`、`plan_complete`、`plan_confirm_required`、`search_progress`、`outline_ready`、`draft_chunk`、`review_notes`、`final_report`、`error`
+- 8 类事件全部实现：`state_update`、`plan_question`、`plan_complete`、`plan_confirm_required`、`search_progress`、`outline_ready`、`draft_chunk`、`review_notes`、`report_ready`、`error`
 - 每条事件带 `event: <name>` 与 `data: {thread_id, ts, payload}`
 
 **结构化日志**

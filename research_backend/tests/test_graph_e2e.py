@@ -90,14 +90,14 @@ def test_graph_invoke_end_to_end(monkeypatch, memory_checkpointer) -> None:
     elapsed = time.perf_counter() - start
 
     assert isinstance(state, dict)
-    assert "final_report" in state
+    assert "report" in state
     assert state["current_step"] == "final"
     assert len(state["research_topics"]) == 2
     assert len(state["search_results"]) == 2
     assert isinstance(state["outline"], Outline)
     assert len(state["outline"].sections) == 2
 
-    final = state["final_report"]
+    final = state["report"]
     assert "[1]" in final
     assert "[2]" in final
     assert "## References" in final

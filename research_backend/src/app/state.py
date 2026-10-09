@@ -30,7 +30,7 @@ class State(TypedDict, total=False):
     draft: str
 
     # Populated by write_compose stage 2 (ticket #7)
-    final_report: str
+    report: str
 
     # Always updated by every node to reflect progress
     current_step: Step

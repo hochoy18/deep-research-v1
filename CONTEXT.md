@@ -56,6 +56,10 @@ _Avoid_: critique、audit、evaluation
 对已接受的 Draft 做最终润色：衔接更顺畅、术语与语气统一、修正错别字与标点。不改变事实、结构或论断。
 _Avoid_: refine、edit、format
 
+**Report**:
+Pipeline run 终态交付的 Markdown 产物：基于 Outline、内嵌 `[N]` 引文、文末附 References 列表。三维 Review 全通过 + Polish 完成后产生；一次 run 唯一。
+_Avoid_: final_report, final_draft, output, summary, final answer, polished draft
+
 ## 人机协作
 
 **Interrupt**:

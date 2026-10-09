@@ -1,9 +1,9 @@
-"""Write node — turn search_results into a Markdown report (tickets #6 + #7).
+"""Write node — turn search_results into a Markdown Report (tickets #6 + #7).
 
 Stage 1 (ticket #6) produces an outline and a draft Markdown body. Stage 2
-(ticket #7) deterministically decorates the draft with ``[N]`` citations and
-appends a ``## References`` section so every cited SearchResult appears in the
-reference list at the bottom.
+(ticket #7) deterministically decorates the draft with ``[N]`` reference
+markers and appends a ``## References`` section so every cited SearchResult
+appears in the reference list at the bottom.
 
 We split the node into two helpers so stage 1 can be exercised in isolation
 without forcing every test to also build a citation inserter.
@@ -114,7 +114,7 @@ def _ensure_blank_line_before_references(body: str) -> str:
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 
 
-def _insert_citation_per_sentence(section_body: str, marker: str) -> str:
+def _insert_reference_marker_per_sentence(section_body: str, marker: str) -> str:
     """Append ``[N]`` after every sentence in ``section_body``.
 
     Splits on sentence-ending punctuation (``.``, ``!``, ``?``) so each factual
@@ -150,7 +150,7 @@ def _build_topics_index(topics: list) -> dict[str, int]:
     return {t.id: i for i, t in enumerate(topics)}
 
 
-def compose_final_report(state: State) -> dict:
+def compose_report(state: State) -> dict:
     """Stage 2 — decorate the draft with ``[N]`` markers and a References section."""
     draft = state.get("draft") or ""
     search_results = state.get("search_results") or []
@@ -179,16 +179,16 @@ def compose_final_report(state: State) -> dict:
     for i, (heading, body) in enumerate(bodies):
         marker = _assign_citation_marker(i, search_results, ref_index, topics_index)
         if marker is not None:
-            body = _insert_citation_per_sentence(body, marker)
+            body = _insert_reference_marker_per_sentence(body, marker)
         rendered.append(f"## {heading}\n\n{body}".rstrip())
 
-    body_with_citations = _ensure_blank_line_before_references("\n\n".join(rendered))
+    body_with_references = _ensure_blank_line_before_references("\n\n".join(rendered))
     refs = [Reference(id=idx + 1, title=r.title, url=r.url) for idx, r in enumerate(search_results)]
     references_block = f"## References\n\n{_render_references(refs)}"
 
-    final_report = f"{body_with_citations}{references_block}\n"
+    report = f"{body_with_references}{references_block}\n"
     return {
-        "final_report": final_report,
+        "report": report,
         "current_step": "final",
     }
 
@@ -197,9 +197,9 @@ def write_compose(state: State) -> dict:
     """Public node entrypoint — runs stage 1 then stage 2 in one go.
 
     Returns a state delta that includes BOTH stages' outputs so the graph state
-    accumulates ``outline``, ``draft``, ``final_report``, and ``current_step``
+    accumulates ``outline``, ``draft``, ``report``, and ``current_step``
     in one node transition.
     """
     stage1_delta = compose_outline_and_draft(state)
-    stage2_delta = compose_final_report({**state, **stage1_delta})
+    stage2_delta = compose_report({**state, **stage1_delta})
     return {**stage1_delta, **stage2_delta}

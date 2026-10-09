@@ -19,7 +19,7 @@ from app.utils import parse_llm_json
 _PLAN_SYSTEM_PROMPT = (
     "You are a research planner. Given a user's research question, decompose it "
     "into 1–5 complementary ResearchTopics that, taken together, would let a "
-    "writer produce a thorough Markdown report. Each topic must be narrowly "
+    "writer produce a thorough Markdown Report. Each topic must be narrowly "
     "scoped enough that one or two web searches could answer it. "
     "Respond ONLY with a JSON object matching the schema below — no prose, no "
     "Markdown fences.\n\n"

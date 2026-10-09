@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 from app.models import ResearchTopic, SearchResult
-from app.nodes.write_compose import compose_final_report, write_compose
+from app.nodes.write_compose import compose_report, write_compose
 
 
 def _state() -> dict:
@@ -41,9 +41,9 @@ def _state() -> dict:
 
 
 def test_stage2_appends_inline_citations() -> None:
-    delta = compose_final_report(_state())
+    delta = compose_report(_state())
     assert delta["current_step"] == "final"
-    final = delta["final_report"]
+    final = delta["report"]
     assert "[1]" in final or "[2]" in final
     # Both sections should pick up citations since there are matching search results.
     assert final.count("[1]") >= 1
@@ -51,8 +51,8 @@ def test_stage2_appends_inline_citations() -> None:
 
 
 def test_stage2_appends_references_section() -> None:
-    delta = compose_final_report(_state())
-    final = delta["final_report"]
+    delta = compose_report(_state())
+    final = delta["report"]
     assert "## References" in final
     refs_section = final.split("## References", 1)[1]
     assert "[1] A1 result — https://x.test/a1" in refs_section
@@ -62,8 +62,8 @@ def test_stage2_appends_references_section() -> None:
 def test_stage2_references_match_search_results() -> None:
     """Every entry in the references block maps 1-to-1 to a search result."""
     state = _state()
-    delta = compose_final_report(state)
-    final = delta["final_report"]
+    delta = compose_report(state)
+    final = delta["report"]
     refs_section = final.split("## References", 1)[1]
     for result in state["search_results"]:
         assert f"— {result.url}" in refs_section
@@ -76,7 +76,7 @@ def test_stage2_rejects_missing_draft() -> None:
     state = _state()
     state["draft"] = ""
     with pytest.raises(RuntimeError, match="no draft"):
-        compose_final_report(state)
+        compose_report(state)
 
 
 def test_stage2_rejects_missing_search_results() -> None:
@@ -85,7 +85,7 @@ def test_stage2_rejects_missing_search_results() -> None:
     state = _state()
     state["search_results"] = []
     with pytest.raises(RuntimeError, match="no search_results"):
-        compose_final_report(state)
+        compose_report(state)
 
 
 def test_full_write_compose_runs_both_stages(patched_chat_model) -> None:
@@ -107,8 +107,8 @@ def test_full_write_compose_runs_both_stages(patched_chat_model) -> None:
     )
 
     delta = write_compose(_state())
-    assert "final_report" in delta
-    final = delta["final_report"]
+    assert "report" in delta
+    final = delta["report"]
     assert "## References" in final
     assert "[1]" in final
     assert "[2]" in final

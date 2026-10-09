@@ -42,7 +42,7 @@ curl -X POST http://localhost:8000/runs \
 # {"thread_id":"<uuid>"}
 
 curl http://localhost:8000/runs/<thread_id>
-# full State including final_report (Markdown with [N] citations + ## References)
+# full State including report (Markdown with [N] citations + ## References)
 ```
 
 ## Tests

@@ -36,6 +36,7 @@ full route + ``StreamingResponse`` stack.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -97,17 +98,28 @@ class _FakeTask:
 class _FakeSnapshot:
     """Stand-in for the ``StateSnapshot`` from ``graph.get_state(config)``.
 
-    The SSE generator touches only ``.values`` (dict) and ``.tasks``
-    (iterable of objects with ``.interrupts``); tests can script both.
+    The SSE generator touches ``.values`` (dict), ``.tasks`` (iterable
+    of objects with ``.interrupts``), and ``.next`` (tuple of pending
+    node names — empty means the graph is at END; the close-condition
+    fix for issue #14 reads this).
+
+    ``next`` defaults to a non-empty tuple so existing tests that
+    weren't exercising the ``next=()`` close path continue to close
+    only via ``current_step in ("final", "failed")`` (or the
+    empty-values-and-tasks guard). Tests that want to script the
+    standalone-plan-subgraph "research + next=()" shape pass
+    ``next=()`` explicitly.
     """
 
     def __init__(
         self,
         values: dict[str, Any] | None = None,
         tasks: list[_FakeTask] | None = None,
+        next: tuple[str, ...] = ("plan_subgraph",),
     ) -> None:
         self.values = values or {}
         self.tasks = tasks or []
+        self.next = next
 
 
 class _MockGraph:
@@ -833,6 +845,92 @@ async def test_real_checkpointer_unknown_thread_closes_immediately() -> None:
         )
     ]
     assert chunks == []
+
+
+@pytest.mark.asyncio
+async def test_real_plan_subgraph_completion_closes_stream(monkeypatch) -> None:
+    """A completed standalone plan subgraph closes the SSE stream.
+
+    Regression for the bug where ``stream_plan_events`` only closed on
+    ``current_step in ("final", "failed")``. The standalone plan
+    subgraph terminates with ``current_step='research'`` and
+    ``next=()`` — neither half of the old condition matched, so the
+    stream polled forever against a thread the graph will never
+    advance. The fix adds ``not snapshot.next`` as a close signal
+    (canonical "graph at END"), which fires here without breaking the
+    failure path (where ``next`` stays non-empty after the failing
+    node — see ``test_graph_failure_writes_failed_state_and_finalizes_the_stream``).
+
+    ``asyncio.timeout(2.0)`` converts the hang into a real
+    ``TimeoutError``; without the timeout the test deadlocks
+    ``async for`` instead of failing, and pytest can't report a verdict.
+    """
+    from app.graph.subgraphs.plan import build_plan_subgraph
+    from app.tools import llm
+
+    topics_payload = {
+        "topics": [
+            {
+                "id": "topic-1",
+                "title": "T1",
+                "description": "d1",
+                "expected_finding_type": "f1",
+            }
+        ]
+    }
+    stub_chat = _StubChat(
+        [
+            json.dumps(
+                {
+                    "questions": [],
+                    "reasoning": "Have enough; ready to plan.",
+                    "ready_to_proceed": True,
+                }
+            ),
+            json.dumps(topics_payload),
+        ]
+    )
+    monkeypatch.setattr(llm, "get_chat_model", lambda: stub_chat)
+
+    real_graph = build_plan_subgraph(MemorySaver())
+    thread_id = str(uuid.uuid4())
+    config = _build_config(thread_id)
+
+    final = real_graph.invoke({"user_query": "Tell me about X"}, config=config)
+    assert final["current_step"] == "research", (
+        "precondition: the standalone subgraph must have finalised"
+    )
+    # Sanity — the subgraph is at END; this is the close signal the
+    # fix relies on.
+    assert real_graph.get_state(config).next == ()
+
+    class _NeverDisconnects:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    chunks: list[bytes] = []
+    try:
+        async with asyncio.timeout(2.0):
+            async for c in stream_plan_events(
+                _NeverDisconnects(), real_graph, config, thread_id
+            ):
+                chunks.append(c)
+    except TimeoutError:
+        pytest.fail(
+            "SSE stream did not close for a completed standalone plan "
+            "subgraph within 2s — stream_plan_events must close on "
+            "`not snapshot.next` (graph at END), not just on "
+            "`current_step in ('final', 'failed')`."
+        )
+
+    # One plan_complete frame with the topics the finalizer produced.
+    assert len(chunks) == 1, f"expected exactly one plan_complete frame, got {chunks!r}"
+    frame = chunks[0].decode("utf-8")
+    assert frame.startswith("event: plan_complete\ndata: ")
+    assert frame.endswith("\n\n")
+    envelope = json.loads(frame.split("data: ", 1)[1].split("\n\n", 1)[0])
+    assert envelope["thread_id"] == thread_id
+    assert envelope["payload"]["research_topics"][0]["id"] == "topic-1"
 
 
 def test_graph_failure_writes_failed_state_and_finalizes_the_stream(

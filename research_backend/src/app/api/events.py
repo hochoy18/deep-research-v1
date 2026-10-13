@@ -238,7 +238,20 @@ async def stream_plan_events(
             )
 
         # Step 3 — close on the terminal states (issue #14 AC).
-        if current_step in ("final", "failed"):
+        # Two close signals combine to cover all reachable terminals:
+        #   * `current_step in ("final", "failed")` — the main graph's
+        #     natural terminal ("final") and the route's failure-marker
+        #     write ("failed"; ADR-0008 fast-fail). The graph's `next`
+        #     may still be non-empty in the failed case (the failing
+        #     node never completed, so LangGraph keeps it pending) —
+        #     this signal is load-bearing there. Regression test:
+        #     ``test_graph_failure_writes_failed_state_and_finalizes_the_stream``.
+        #   * `not snapshot.next` — the canonical "graph at END"
+        #     signal. Covers the standalone plan subgraph, which
+        #     terminates with ``current_step='research'`` (not in the
+        #     failure/final set) and ``next=()``. Regression test:
+        #     ``test_real_plan_subgraph_completion_closes_stream``.
+        if not snapshot.next or current_step in ("final", "failed"):
             return
 
         await asyncio.sleep(SSE_POLL_INTERVAL_SECONDS)

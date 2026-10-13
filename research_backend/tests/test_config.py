@@ -25,7 +25,6 @@ def track_load_dotenv(monkeypatch: pytest.MonkeyPatch):
 
     def _tracker(**kwargs):
         calls.append(kwargs)
-        return None  # don't actually touch os.environ
 
     monkeypatch.setattr(config_module, "load_dotenv", _tracker)
     return calls

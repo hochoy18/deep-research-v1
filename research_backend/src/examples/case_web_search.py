@@ -16,9 +16,10 @@ Bailian app instead of a stub, edit ``.env``::
     DASHSCOPE_MCP_APP_ID=<your-bailian-app-id>
 """
 
+from rich import print as rprint
+
 from app.models import SearchResult
 from app.tools.web_search import get_web_search
-from rich import print as rprint
 
 QUERY = "调研欧美国家 酒店行业 在AI Agent 的落地使用"
 TOPIC_ID = "topic-1"

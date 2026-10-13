@@ -325,6 +325,9 @@ def test_cross_model_kind_to_value_narrowing_round_trips() -> None:
 def test_plan_state_declares_all_required_fields() -> None:
     from app.state import PlanState
 
+    # v0.2 set is preserved additively; v0.3 (issue #22) adds the two
+    # transition-gate fields. See ``test_state_transition_gate.py`` for the
+    # dedicated AC pinning the new fields' presence and types.
     expected = {
         "user_query",
         "messages",
@@ -334,5 +337,8 @@ def test_plan_state_declares_all_required_fields() -> None:
         "ready_to_proceed",
         "research_topics",
         "current_step",
+        # v0.3 — issue #22: transition-gate writes.
+        "confirmed_research_plan",
+        "plan_edit_diff",
     }
     assert set(PlanState.__annotations__.keys()) == expected

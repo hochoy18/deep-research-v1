@@ -6,6 +6,8 @@ the API responses. Naming follows the glossary in ``CONTEXT.md``.
 
 from __future__ import annotations
 
+from typing import Annotated, Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -75,3 +77,139 @@ class SearchResultsByTopic(BaseModel):
         default_factory=dict,
         description="Mapping from ResearchTopic.id to its list of SearchResult",
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan HITL data shapes (v0.2 — issue #11)
+#
+# The Plan subgraph asks structured questions in multiple rounds until the
+# questioner signals ``ready_to_proceed``. Each round the questioner emits a
+# ``PlanQuestionerBatch``; the user replies with a ``PlanAnswerBatch``; the
+# API/SSE layer hands the user a ``PlanInterruptPayload`` describing what to
+# fill in. All shapes are additive to v0.1 — ``plan_decompose`` still runs as
+# before and no node currently emits these.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class PlanQuestionOption(BaseModel):
+    """One option for a single- or multi-choice plan question."""
+
+    model_config = ConfigDict(frozen=True)
+
+    option_id: str = Field(..., description="Stable option identifier; the user picks this")
+    label: str = Field(..., description="Human-readable option label")
+
+
+class SingleChoicePlanQuestion(BaseModel):
+    """A question whose answer is exactly one ``option_id``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["single_choice"] = "single_choice"
+    id: str = Field(..., description="Stable question identifier, used to match answers")
+    prompt: str = Field(..., description="The question text shown to the user")
+    options: list[PlanQuestionOption] = Field(
+        ..., description="Options the user can pick from (one will be chosen)"
+    )
+
+
+class MultiChoicePlanQuestion(BaseModel):
+    """A question whose answer is a list of ``option_id``s."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["multi_choice"] = "multi_choice"
+    id: str = Field(..., description="Stable question identifier, used to match answers")
+    prompt: str = Field(..., description="The question text shown to the user")
+    options: list[PlanQuestionOption] = Field(
+        ..., description="Options the user can pick from (any subset may be chosen)"
+    )
+
+
+class FreeTextPlanQuestion(BaseModel):
+    """A question whose answer is a free-form string."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["free_text"] = "free_text"
+    id: str = Field(..., description="Stable question identifier, used to match answers")
+    prompt: str = Field(..., description="The question text shown to the user")
+    placeholder: str | None = Field(
+        default=None, description="Optional placeholder text shown in the input box"
+    )
+
+
+class ConfirmationPlanQuestion(BaseModel):
+    """A yes/no confirmation question."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["confirmation"] = "confirmation"
+    id: str = Field(..., description="Stable question identifier, used to match answers")
+    prompt: str = Field(..., description="The question text shown to the user")
+
+
+# Discriminated union over the four kinds. Each member shares ``id``/``prompt``
+# and a ``kind`` literal; the runtime type of ``options``/``placeholder`` and
+# the accepted answer ``value`` narrows by ``kind`` (see ``PlanUserAnswer``).
+PlanQuestion = Annotated[
+    SingleChoicePlanQuestion
+    | MultiChoicePlanQuestion
+    | FreeTextPlanQuestion
+    | ConfirmationPlanQuestion,
+    Field(discriminator="kind"),
+]
+
+
+class PlanUserAnswer(BaseModel):
+    """The user's reply to a single ``PlanQuestion``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    question_id: str = Field(..., description="The ``PlanQuestion.id`` being answered")
+    value: str | list[str] | bool = Field(
+        ...,
+        description=(
+            "Answer value; the runtime type is narrowed by the matching question's "
+            "``kind``: single_choice/free_text → str, multi_choice → list[str], "
+            "confirmation → bool"
+        ),
+    )
+
+
+class PlanQuestionerBatch(BaseModel):
+    """One batch the questioner emits in a single round."""
+
+    model_config = ConfigDict(frozen=True)
+
+    questions: list[PlanQuestion] = Field(
+        default_factory=list, description="The questions to ask in this round"
+    )
+    reasoning: str = Field(
+        default="", description="Why the questioner is asking these questions right now"
+    )
+    ready_to_proceed: bool = Field(
+        default=False,
+        description="True once the questioner is satisfied and the plan can be built",
+    )
+
+
+class PlanAnswerBatch(BaseModel):
+    """One round of user answers returned to the plan subgraph."""
+
+    model_config = ConfigDict(frozen=True)
+
+    round: int = Field(..., description="1-based round index this batch answers")
+    answers: list[PlanUserAnswer] = Field(
+        default_factory=list, description="The user's answers to this round's questions"
+    )
+
+
+class PlanInterruptPayload(BaseModel):
+    """The API + SSE contract: questions waiting for the user's input."""
+
+    model_config = ConfigDict(frozen=True)
+
+    questions: list[PlanQuestion] = Field(..., description="Questions the user must answer")
+    reasoning: str = Field(..., description="Why the questioner is asking these questions")
+    round: int = Field(..., description="1-based round index this interrupt belongs to")

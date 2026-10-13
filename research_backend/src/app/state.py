@@ -17,9 +17,16 @@ from __future__ import annotations
 
 from typing import Literal
 
+from langchain_core.messages import BaseMessage
 from typing_extensions import TypedDict
 
-from app.models import Outline, ResearchTopic, SearchResult
+from app.models import (
+    Outline,
+    PlanQuestion,
+    PlanUserAnswer,
+    ResearchTopic,
+    SearchResult,
+)
 
 # Pipeline stages; mirrored by the LangGraph node names.
 Step = Literal["plan", "research", "write", "final", "failed"]
@@ -105,4 +112,29 @@ class WriteOutput(TypedDict, total=False):
     outline: Outline
     draft: str
     report: str
+    current_step: Step
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan subgraph-local state (v0.2 — issue #11)
+#
+# ``PlanState`` is the schema the plan subgraph operates on once the HITL
+# rewrite (issue #9) replaces the v0.1 single-shot ``plan_decompose`` node. It
+# accumulates one round at a time: the questioner writes ``last_questions``,
+# the user reply is folded into ``last_answers``, and once
+# ``ready_to_proceed`` is True the plan subgraph produces
+# ``research_topics`` and the main graph moves on.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class PlanState(TypedDict, total=False):
+    """Subgraph-local state for the plan HITL loop (issue #9 / #11)."""
+
+    user_query: str
+    messages: list[BaseMessage]
+    round: int
+    last_questions: list[PlanQuestion]
+    last_answers: list[PlanUserAnswer]
+    ready_to_proceed: bool
+    research_topics: list[ResearchTopic]
     current_step: Step

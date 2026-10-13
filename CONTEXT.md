@@ -21,14 +21,22 @@ _Avoid_: search stage、gather、retrieve
 _Avoid_: output stage、draft stage
 
 **Transition gate**:
-两个阶段之间的人机协作检查点，用户可在此审阅并编辑交接产物（主题列表），下一阶段才会启动。
+两个阶段之间的人机协作检查点，用户可在此审阅并编辑交接产物（主题列表），下一阶段才会启动。v0.3 在 Plan → Research 之间存在一道转换门（plan → research transition gate）。该门是 dumb pass-through：不调用 LLM、不重新校验 topic 语义、不引入 re-loop 回 Plan 阶段。空 topic 列表被双重拒绝（客户端禁用 + 服务端 `EMPTY_PLAN` 400）。详见 ADR-0005。
 _Avoid_: review gate、handoff
 
 ## 研究产物
 
 **Topic**:
-从用户整体问题中拆出的单个子问题，范围足够窄，可用一组有限的网络搜索来回答。research plan 即一组 Topic。
+从用户整体问题中拆出的单个子问题，范围足够窄，可用一组有限的网络搜索来回答。research plan 即一组 Topic。每个 Topic 自首次拆出起携带稳定 UUIDv4 ID，跨 transition gate 的增 / 改 / 删保留该 ID。详见 ADR-0005 第 2 条。
 _Avoid_: subtopic、question、query
+
+**Research plan**:
+Plan 阶段产出（或用户在 transition gate 编辑后）的 topic 列表。state 中并存两个版本：`research_plan`（LLM 草稿）与 `confirmed_research_plan`（用户最终版），后者由 confirm-plan 触发后写入。Research subgraph 只读取 `confirmed_research_plan`。
+_Avoid_: topic list、subtopics、questions、research topics
+
+**Plan edit diff**:
+transition gate 上用户对 research plan 的修改结构化记录：`{added: [...新 topic], removed: [id...], modified: [{id, before: {...}, after: {...}}]}`。与 `confirmed_research_plan` 同步写入。供事后追溯"报告为什么偏离原始 LLM 计划"用。
+_Avoid_: edit history、change log、audit log
 
 **Search result**:
 一次检索到的一个网页：其 URL、标题、摘要，以及（可选的）提取全文。携带来自搜索服务的相关性评分。

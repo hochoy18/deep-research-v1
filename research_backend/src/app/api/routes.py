@@ -81,6 +81,24 @@ def _get_graph_or_503(request: Request):
     return graph
 
 
+def _get_state_or_404(graph, config: dict[str, Any]):
+    """Return the checkpoint snapshot for ``config``, or raise 404.
+
+    ``get_run`` and ``answer_run`` need the same thread-existence guard.
+    A missing thread shows up in two shapes: ``get_state`` returns
+    ``None``, or — what ``MemorySaver`` does — a ``StateSnapshot`` whose
+    ``values`` is an empty dict. Both mean "nothing to act on", so the
+    falsy check must cover them; otherwise a resume against an unknown
+    thread falls through to ``graph.invoke`` and crashes in
+    ``plan_questioner`` with ``user_query is empty``. Centralising here
+    keeps the error message in one place (see ``_get_graph_or_503``).
+    """
+    snapshot = graph.get_state(config)
+    if snapshot is None or not snapshot.values:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return snapshot
+
+
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -97,10 +115,7 @@ async def create_run(payload: CreateRunRequest, request: Request) -> RunCreatedR
 @router.get("/runs/{thread_id}")
 async def get_run(thread_id: str, request: Request) -> dict[str, Any]:
     graph = _get_graph_or_503(request)
-    snapshot = graph.get_state(_build_config(thread_id))
-    if snapshot is None or snapshot.values is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-
+    snapshot = _get_state_or_404(graph, _build_config(thread_id))
     return _to_jsonable(snapshot.values)
 
 
@@ -126,9 +141,7 @@ async def answer_run(
     """
     graph = _get_graph_or_503(request)
     config = _build_config(thread_id)
-    snapshot = graph.get_state(config)
-    if snapshot is None or snapshot.values is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
+    snapshot = _get_state_or_404(graph, config)
 
     # ``state['round']`` is 0-indexed (incremented by ``plan_questioner``
     # after each resume). The user-facing ``PlanAnswerBatch.round`` and

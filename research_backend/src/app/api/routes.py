@@ -1,14 +1,19 @@
-"""HTTP routes — health, run creation, run inspection, plan answer resume (issue #13)."""
+"""HTTP routes — health, run creation, run inspection, plan answer resume (issue #13),
+and the Plan-stage SSE event stream (issue #14).
+"""
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from app.api.events import stream_plan_events
 from app.models import PlanAnswerBatch, PlanUserAnswer
 from app.nodes.research_run import RECURSION_LIMIT
 
@@ -70,10 +75,11 @@ def _to_jsonable(value: Any) -> Any:
 def _get_graph_or_503(request: Request):
     """Return the compiled graph bound to ``app.state``, or raise 503.
 
-    Three routes (``create_run``, ``get_run``, ``answer_run``) all need
-    the same lifespan guard — a missing graph means the FastAPI lifespan
-    handler has not run (e.g. in tests that bypass ``app.state.graph``
-    assignment). Centralising here keeps the error message in one place.
+    All four graph-backed routes (``create_run``, ``get_run``,
+    ``answer_run``, ``stream_run_events``) need the same lifespan guard —
+    a missing graph means the FastAPI lifespan handler has not run (e.g.
+    in tests that bypass ``app.state.graph`` assignment). Centralising
+    here keeps the error message in one place.
     """
     graph = request.app.state.graph
     if graph is None:  # pragma: no cover — only when lifespan hasn't run
@@ -99,6 +105,28 @@ def _get_state_or_404(graph, config: dict[str, Any]):
     return snapshot
 
 
+def _mark_run_failed(graph, config: dict[str, Any]) -> None:
+    """Persist ``current_step="failed"`` after a graph invocation raises.
+
+    ADR-0008 fast-fail is preserved — the exception still propagates to
+    the caller (HTTP 500) — but an open ``GET /runs/{id}/events`` stream
+    polls *checkpoint state* only: without this write it could never
+    observe the failure and would poll until the client disconnected
+    (issue #14 AC "the stream closes when the graph fails"; parent #9
+    fixes the final frame as ``plan_complete`` with empty topics).
+    Best-effort: if the checkpointer itself is down there is no stream
+    to notify, and the original raise still surfaces.
+
+    Schema caveat: ``update_state`` filters writes through the graph's
+    input schema — the main graph's ``State`` accepts ``current_step``
+    (the production shape this helper is designed for), but a
+    standalone plan subgraph (``PlanInput`` = ``user_query`` only) would
+    silently drop the marker.
+    """
+    with contextlib.suppress(Exception):  # checkpointer itself down → nothing to notify
+        graph.update_state(config, {"current_step": "failed"})
+
+
 @router.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -108,7 +136,12 @@ async def health() -> dict[str, str]:
 async def create_run(payload: CreateRunRequest, request: Request) -> RunCreatedResponse:
     graph = _get_graph_or_503(request)
     thread_id = str(uuid.uuid4())
-    graph.invoke({"user_query": payload.user_query}, config=_build_config(thread_id))
+    config = _build_config(thread_id)
+    try:
+        graph.invoke({"user_query": payload.user_query}, config=config)
+    except Exception:
+        _mark_run_failed(graph, config)
+        raise
     return RunCreatedResponse(thread_id=thread_id)
 
 
@@ -151,5 +184,48 @@ async def answer_run(
         round=persisted_round + 1,
         answers=payload.answers,
     )
-    graph.invoke(Command(resume=answer_batch), config=config)
+    try:
+        graph.invoke(Command(resume=answer_batch), config=config)
+    except Exception:
+        _mark_run_failed(graph, config)
+        raise
     return AnswerAcceptedResponse(thread_id=thread_id)
+
+
+@router.get("/runs/{thread_id}/events")
+async def stream_run_events(thread_id: str, request: Request) -> StreamingResponse:
+    """Stream Plan-stage lifecycle events as Server-Sent Events (issue #14).
+
+    v0.2 ships two event types; the other six land in v0.5:
+
+    * ``plan_question`` — fired when the Plan subgraph enters
+      ``interrupt()`` on a new round; payload is
+      ``PlanInterruptPayload.model_dump()``.
+    * ``plan_complete`` — fired when the Plan subgraph writes
+      ``current_step="research"`` (or hits the ``"failed"`` terminal
+      state); payload is ``{research_topics: list[ResearchTopic]}``.
+
+    The wire contract — envelope, frame layout, and stream-close
+    conditions — is specified in ``app.api.events`` (module docstring
+    plus ``stream_plan_events``); read it there rather than duplicating
+    it here. Failure note: ``create_run`` / ``answer_run`` persist
+    ``current_step="failed"`` via ``_mark_run_failed`` before
+    propagating the 500, which is what lets an open stream observe the
+    fast-fail (ADR-0008) and close.
+
+    The response headers disable any proxy buffering
+    (``X-Accel-Buffering: no``) so events arrive live even when the
+    service is fronted by nginx; ``Cache-Control: no-store`` keeps
+    SSE responses out of caches that would otherwise buffer them.
+    """
+    graph = _get_graph_or_503(request)
+    config = _build_config(thread_id)
+    return StreamingResponse(
+        stream_plan_events(request, graph, config, thread_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

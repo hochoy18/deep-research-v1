@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ResearchTopic(BaseModel):
@@ -22,6 +22,19 @@ class ResearchTopic(BaseModel):
     expected_finding_type: str = Field(
         ..., description="What kind of evidence this topic should surface"
     )
+
+    @field_validator("id")
+    @classmethod
+    def _id_not_blank(cls, value: str) -> str:
+        """Reject empty or whitespace-only topic ids.
+
+        Topic ids are the join key across the gate diff (``PlanEditDiff``),
+        the SSE payload (``PlanConfirmInterruptPayload``), and the state
+        audit trail. A blank id would silently merge two unrelated edits.
+        """
+        if not value or not value.strip():
+            raise ValueError("ResearchTopic.id must be a non-empty, non-whitespace string")
+        return value
 
 
 class SearchResult(BaseModel):
@@ -213,3 +226,100 @@ class PlanInterruptPayload(BaseModel):
     questions: list[PlanQuestion] = Field(..., description="Questions the user must answer")
     reasoning: str = Field(..., description="Why the questioner is asking these questions")
     round: int = Field(..., description="1-based round index this interrupt belongs to")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan → Research transition gate data shapes (v0.3 — issue #21)
+#
+# The transition gate is the dumb pass-through between Plan and Research:
+# Plan emits ``research_topics``; the user reviews the list at the gate;
+# the API receives the final list via ``ConfirmedResearchTopics`` and the
+# diff vs the LLM draft via ``PlanEditDiff``. The API/SSE layer hands the
+# user a ``PlanConfirmInterruptPayload`` describing the draft so the front
+# end can render the table without an extra RTT. See ADR-0005.
+#
+# These are pure data contracts — no logic. The gate node is issue #23;
+# the API surface is issue #24; the SSE event is issue #25; the gate's
+# behavior tests are issue #26.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class ConfirmedResearchTopics(BaseModel):
+    """The body of ``POST /runs/{id}/confirm-plan`` — the user's final topic list.
+
+    The front end always sends the complete final list (no diff protocol —
+    see ADR-0005 §3). ``topics`` is required at the model level so a
+    missing field fails closed at parse time (422). An explicit empty
+    list (``"topics": []``) still parses — the API layer rejects it with
+    code ``EMPTY_PLAN`` (issue #24).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    topics: list[ResearchTopic] = Field(
+        ...,
+        description="Final research topics the user confirmed (non-empty enforced at the API layer)",
+    )
+
+
+class ModifiedTopic(BaseModel):
+    """One entry in ``PlanEditDiff.modified`` — same id, edited content.
+
+    ``before`` and ``after`` carry full ``ResearchTopic`` snapshots so the
+    audit trail can attribute any field-level drift to the user's edit
+    without needing the LLM draft to be looked up elsewhere.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str = Field(..., description="Topic id of the entry that was edited")
+    before: ResearchTopic = Field(
+        ..., description="The ResearchTopic as the LLM drafted it"
+    )
+    after: ResearchTopic = Field(
+        ..., description="The ResearchTopic after the user's edit"
+    )
+
+
+class PlanEditDiff(BaseModel):
+    """The structured audit trail of the user's edits at the transition gate.
+
+    Per ADR-0005 §7 the state records added / removed / modified topics so
+    a "report drift" complaint can be attributed to either the LLM or the
+    user's edits without re-running either side.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    added: list[ResearchTopic] = Field(
+        default_factory=list,
+        description="Topics the user added that weren't in the LLM draft",
+    )
+    removed: list[str] = Field(
+        default_factory=list,
+        description="Topic ids the user removed at the gate",
+    )
+    modified: list[ModifiedTopic] = Field(
+        default_factory=list,
+        description="Topics the user edited (id is shared with before/after)",
+    )
+
+
+class PlanConfirmInterruptPayload(BaseModel):
+    """The API + SSE contract: the draft topic list waiting for confirmation.
+
+    Inline on the SSE ``plan_confirm_required`` event so the front end can
+    render the review table without an extra RTT (ADR-0005 §5). Distinct
+    from ``PlanInterruptPayload``, which carries structured Q&A questions
+    during the Plan HITL loop and is emitted on ``plan_interrupt``.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    topics: list[ResearchTopic] = Field(
+        ..., description="The draft topics the user should review"
+    )
+    reasoning: str = Field(
+        default="",
+        description="Why the planner proposes these topics (shown above the table)",
+    )

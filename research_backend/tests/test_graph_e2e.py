@@ -111,12 +111,30 @@ def test_graph_invoke_end_to_end(monkeypatch, memory_checkpointer) -> None:
 
 
 def test_graph_node_chain_is_correct(memory_checkpointer) -> None:
-    """Sanity: graph has the expected 4 nodes (plus LangGraph's __start__)."""
+    """Sanity: main graph has the expected 3 subgraphs + finalize as nodes (plus LangGraph's __start__)."""
     from app.graph import build_graph
 
     graph = build_graph(memory_checkpointer)
     nodes = list(graph.nodes.keys())
-    assert "plan_decompose" in nodes
-    assert "research_run" in nodes
-    assert "write_compose" in nodes
+    assert "plan_subgraph" in nodes
+    assert "research_subgraph" in nodes
+    assert "write_subgraph" in nodes
     assert "finalize" in nodes
+
+
+def test_graph_has_explicit_finalize_node(memory_checkpointer) -> None:
+    """Regression (issue #10): v0.2 dropped the explicit ``_finalize`` terminal node
+    that wrote ``current_step: "final"``. ``write_compose`` happens to write it
+    implicitly (line 190 of ``src/app/nodes/write_compose.py``), but that's a
+    hidden contract — if it drifts, the E2E assertion at line 96 starts failing
+    for the wrong reason. Pin the explicit node so the terminal ``"final"`` step
+    is owned by the main graph, not borrowed from a side effect.
+    """
+    from app.graph import build_graph
+
+    graph = build_graph(memory_checkpointer)
+    nodes = list(graph.nodes.keys())
+    assert "finalize" in nodes, (
+        f"main graph must own an explicit 'finalize' node; "
+        f"found nodes: {sorted(nodes)}"
+    )

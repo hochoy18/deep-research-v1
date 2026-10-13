@@ -8,8 +8,16 @@ import uuid
 
 
 def test_graph_invoke_end_to_end(monkeypatch, memory_checkpointer) -> None:
-    """Run the whole pipeline via ``graph.invoke`` with every external mocked."""
-    plan_payload = {
+    """Run the whole pipeline via ``graph.invoke`` with every external mocked.
+
+    Issue #12 updated the plan stage to a multi-round HITL loop. The
+    question-emit LLM is now the first call: we script it to return
+    ``ready_to_proceed=true`` on round 1 so the plan stage finalizes in
+    one entry (after the resume re-run consumes the second scripted
+    response). Then the topic-finalize LLM runs and produces the
+    research_topics.
+    """
+    topics_payload = {
         "topics": [
             {
                 "id": "topic-1",
@@ -45,7 +53,21 @@ def test_graph_invoke_end_to_end(monkeypatch, memory_checkpointer) -> None:
 
     class _StubChat:
         def __init__(self) -> None:
-            self.responses = [json.dumps(plan_payload), json.dumps(write_payload)]
+            # Order: question-emit (round 1) → ready_to_proceed=true, so the
+            # node short-circuits to topic-finalize in the same entry. Then
+            # write stage 1. Total 3 LLM calls — no resume re-run because
+            # ready_to_proceed skips ``interrupt()``.
+            self.responses = [
+                json.dumps(
+                    {
+                        "questions": [],
+                        "reasoning": "Have enough; ready to plan.",
+                        "ready_to_proceed": True,
+                    }
+                ),
+                json.dumps(topics_payload),
+                json.dumps(write_payload),
+            ]
 
         def invoke(self, messages, **_kwargs):
             content = self.responses.pop(0) if self.responses else "{}"

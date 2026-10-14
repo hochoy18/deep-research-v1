@@ -27,10 +27,21 @@ def _format_query(topic) -> str:
 
 
 def research_run(state: State, config: RunnableConfig) -> dict:
-    """Run one web search per topic and collect the results into ``search_results``."""
-    topics = state.get("research_topics") or []
+    """Run one web search per topic and collect the results into ``search_results``.
+
+    v0.3 — issue #26: the searches run on the user's final list
+    (``confirmed_research_plan``, written by ``confirm_plan_gate``)
+    when present, falling back to the LLM draft ``research_topics``
+    only when the gate has not run (ADR-0005 §6 — the Research stage
+    must reflect the user's confirmed intent, never the pre-gate
+    draft, once the gate has produced a final list).
+    """
+    topics = state.get("confirmed_research_plan") or state.get("research_topics") or []
     if not topics:
-        raise RuntimeError("Research node: state has no research_topics")
+        raise RuntimeError(
+            "Research node: state has no confirmed_research_plan "
+            "and no research_topics"
+        )
     if config is None or "recursion_limit" not in config:
         raise RuntimeError(
             "Research node: caller must pass a RunnableConfig with "

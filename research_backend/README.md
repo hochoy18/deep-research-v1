@@ -112,7 +112,10 @@ Streams two event types in the v0.5 forward-compatible envelope:
   round). Fired when the Plan subgraph enters `interrupt()` on a new round.
 - **`plan_complete`** — payload = `{research_topics: list[ResearchTopic]}`.
   Fired exactly once per connection as soon as `current_step` advances
-  past `"plan"` (`"research"`, `"write"`, `"final"`, or `"failed"`). On a
+  past `"plan"` (`"research"`, `"write"`, `"final"`, or `"failed"`).
+  The v0.3 gate-open marker `"confirm"` deliberately does NOT fire it —
+  the Plan stage is only complete once the user has confirmed their
+  final topic list. On a
   failed run the topic list is empty (the dedicated `error` event lands
   in v0.5).
 

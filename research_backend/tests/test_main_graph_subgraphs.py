@@ -38,7 +38,13 @@ import uuid
 from langgraph.types import Command
 
 from app.graph import build_graph
-from app.models import ConfirmedResearchTopics, Outline
+from app.models import (
+    ConfirmedResearchTopics,
+    Outline,
+    PlanAnswerBatch,
+    PlanUserAnswer,
+    ResearchTopic,
+)
 from app.nodes.research_run import RECURSION_LIMIT
 from app.state import State
 
@@ -207,3 +213,213 @@ def test_end_to_end_with_immediate_ready_to_proceed(
     # id-format change.
     assert "## History" in report
     assert "## Current state" in report
+
+
+def test_end_to_end_with_gate_edit(
+    fake_chat_model, fake_search_tool, memory_checkpointer
+) -> None:
+    """Issue #26 AC — full E2E with a real gate edit feeding into Research + Write.
+
+    The pipeline walks every v0.3 stage: 1 Q&A round → ``ready_to_proceed``
+    → topic-finalize (the LLM's 3) → gate pause → the user adds 1 topic,
+    deletes 1, and modifies 1 → gate resume → Research runs ONE SEARCH PER
+    USER-FINAL TOPIC (not the LLM's 3) → Write produces a report → END.
+
+    The load-bearing assertion is the search-call set: the topics the
+    user confirmed (2 preserved draft ids + 1 gate-minted uuid4) are
+    exactly the topics the searches ran on — pinning that Research
+    consumes ``confirmed_research_plan``, never the pre-gate draft
+    (ADR-0005 §6). The dual-field contract is pinned too: the LLM draft
+    stays intact in ``research_topics`` while the user's list lands in
+    ``confirmed_research_plan`` alongside a structured ``plan_edit_diff``.
+    """
+    llm_draft = {
+        "topics": [
+            {
+                "id": "topic-1",
+                "title": "Scope",
+                "description": "scope of X",
+                "expected_finding_type": "factual",
+            },
+            {
+                "id": "topic-2",
+                "title": "Evidence",
+                "description": "evidence for X",
+                "expected_finding_type": "data",
+            },
+            {
+                "id": "topic-3",
+                "title": "Limits",
+                "description": "limits of X",
+                "expected_finding_type": "data",
+            },
+        ]
+    }
+    write_payload = {
+        "outline": [
+            {"title": "Refined scope", "summary": "s", "key_points": ["p"]},
+            {"title": "Limits", "summary": "s", "key_points": ["p"]},
+            {"title": "New angle", "summary": "s", "key_points": ["p"]},
+        ],
+        "draft": (
+            "Intro paragraph.\n\n"
+            "## Refined scope\n\nRefined scope fact.\n\n"
+            "## Limits\n\nOne limit fact.\n\n"
+            "## New angle\n\nOne new-angle fact."
+        ),
+    }
+
+    from app.tools import llm as _llm
+
+    _llm.get_chat_model = lambda: fake_chat_model  # type: ignore[assignment]
+
+    fake_chat_model.responses.extend(
+        [
+            # Round 1 questioner: one question, ready=false → HITL pause.
+            json.dumps(
+                {
+                    "questions": [
+                        {
+                            "kind": "free_text",
+                            "id": "q1",
+                            "prompt": "What scope?",
+                            "placeholder": "e.g. last 5 years",
+                        }
+                    ],
+                    "reasoning": "scope",
+                    "ready_to_proceed": False,
+                }
+            ),
+            # Round 1 resume re-run: the SAME question batch (LangGraph
+            # re-executes the node; its ``interrupt()`` re-fires with the
+            # same id and returns the user's answer). The answer consumes
+            # the resume value here — scripting ready=true instead would
+            # leave the resume unconsumed and hand it to the GATE's
+            # interrupt, which expects ConfirmedResearchTopics.
+            json.dumps(
+                {
+                    "questions": [
+                        {
+                            "kind": "free_text",
+                            "id": "q1",
+                            "prompt": "What scope?",
+                            "placeholder": "e.g. last 5 years",
+                        }
+                    ],
+                    "reasoning": "scope",
+                    "ready_to_proceed": False,
+                }
+            ),
+            # Round 2 initial: ready=true → finalize in the same entry.
+            json.dumps(
+                {"questions": [], "reasoning": "done", "ready_to_proceed": True}
+            ),
+            # Topic-finalize: the LLM's 3 draft topics.
+            json.dumps(llm_draft),
+            # Write stage 1: outline + draft over the user's final 3.
+            json.dumps(write_payload),
+        ]
+    )
+
+    graph = build_graph(memory_checkpointer)
+    thread_id = str(uuid.uuid4())
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+
+    # 1. The 1 Q&A round — the questioner pauses on round 1.
+    graph.invoke({"user_query": "Tell me about X"}, config=config)
+
+    # 2. The user answers; the resume re-run finalizes and the gate opens.
+    out = graph.invoke(
+        Command(
+            resume=PlanAnswerBatch(
+                round=1,
+                answers=[PlanUserAnswer(question_id="q1", value="last 5 years")],
+            )
+        ),
+        config=config,
+    )
+    assert "__interrupt__" in out
+    gate_payload = out["__interrupt__"][0].value
+    draft_topics = list(gate_payload.topics)
+    assert len(draft_topics) == 3
+    id_scope, id_evidence, id_limits = [t.id for t in draft_topics]
+
+    # 3. The user's edit set: keep + modify id_scope, drop id_evidence,
+    #    keep id_limits, add one brand-new topic (placeholder slug — the
+    #    gate mints a fresh uuid4 for it per ADR-0005 §2).
+    user_final = [
+        ResearchTopic(
+            id=id_scope,
+            title="Refined scope",
+            description="scope of X, last 5 years",
+            expected_finding_type="factual",
+        ),
+        ResearchTopic(
+            id=id_limits, title="Limits", description="limits of X",
+            expected_finding_type="data",
+        ),
+        ResearchTopic(
+            id="topic-added", title="New angle", description="new angle on X",
+            expected_finding_type="evidence",
+        ),
+    ]
+    state = graph.invoke(
+        Command(resume=ConfirmedResearchTopics(topics=user_final)),
+        config=config,
+    )
+
+    # 4. The pipeline ran to the terminal.
+    assert isinstance(state, dict)
+    assert state["current_step"] == "final"
+    report = state["report"]
+    assert "## References" in report
+    assert "[1]" in report
+
+    # 5. Research ran on the USER's final list — one search per
+    #    confirmed topic, keyed by the confirmed ids (2 preserved + 1
+    #    gate-minted), not the LLM's draft ids.
+    search_calls = fake_search_tool.calls
+    assert len(search_calls) == 3, (
+        f"expected 3 searches (one per confirmed topic), got "
+        f"{len(search_calls)}"
+    )
+    searched_topic_ids = {c["topic_id"] for c in search_calls}
+    confirmed_ids = [t.id for t in state["confirmed_research_plan"]]
+    assert searched_topic_ids == set(confirmed_ids)
+    # The modified topic was searched under its PRESERVED id, and the
+    # dropped draft topic was never searched.
+    assert id_scope in searched_topic_ids
+    assert id_evidence not in searched_topic_ids
+    # The added topic was searched under a gate-minted uuid4, not the
+    # client's placeholder slug.
+    added_id = confirmed_ids[2]
+    assert added_id not in {id_scope, id_evidence, id_limits, "topic-added"}
+    # The search query follows ``{title} — {description}`` of the USER's
+    # wording, not the LLM's draft wording.
+    assert search_calls[0]["query"] == "Refined scope — scope of X, last 5 years"
+
+    # 6. The dual-field contract (ADR-0005 §6): the LLM draft survives
+    #    untouched while the user's list lands in confirmed_research_plan.
+    assert [t.id for t in state["research_topics"]] == [
+        id_scope, id_evidence, id_limits,
+    ]
+    assert [t.title for t in state["confirmed_research_plan"]] == [
+        "Refined scope", "Limits", "New angle",
+    ]
+
+    # 7. The structured audit trail (ADR-0005 §7).
+    diff = state["plan_edit_diff"]
+    assert [m.id for m in diff.modified] == [id_scope]
+    assert diff.modified[0].before.title == "Scope"
+    assert diff.modified[0].after.title == "Refined scope"
+    assert diff.removed == [id_evidence]
+    assert [a.id for a in diff.added] == [added_id]
+    assert diff.added[0].title == "New angle"
+
+    # 8. The search results carry the confirmed topic ids — what the
+    #    References block (and any future reviewer) keys on.
+    assert len(state["search_results"]) == 3
+    assert {r.topic_id for r in state["search_results"]} == set(confirmed_ids)

@@ -118,10 +118,18 @@ class PlanOutput(TypedDict, total=False):
 
 
 class ResearchInput(TypedDict, total=False):
-    """What the research subgraph reads from the main state."""
+    """What the research subgraph reads from the main state.
+
+    v0.3 — issue #26: gains ``confirmed_research_plan`` so the user's
+    final topic list (written by ``confirm_plan_gate``) flows into the
+    research stage. ``research_run`` prefers it over the LLM draft
+    ``research_topics`` — the searches must run on what the user
+    confirmed, not what the LLM first proposed (ADR-0005 §6).
+    """
 
     user_query: str
     research_topics: list[ResearchTopic]
+    confirmed_research_plan: list[ResearchTopic]
 
 
 class ResearchOutput(TypedDict, total=False):

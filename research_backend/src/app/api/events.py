@@ -19,7 +19,9 @@ ships with three event types in v0.3; the remaining five land in v0.5:
 * ``plan_complete`` — fired when the Plan subgraph writes
   ``current_step="research"`` (or hits the ``"failed"`` terminal
   state). Payload is ``{research_topics: list[ResearchTopic]}``;
-  empty list on failure.
+  empty list on failure. The gate-open marker ``"confirm"`` does NOT
+  fire it — the Plan stage is only complete once the user has
+  confirmed their final topic list (issue #26).
 
 The wire shape is locked for v0.5 forward-compat::
 
@@ -271,18 +273,23 @@ async def stream_plan_events(
 
         # Step 2 — emit plan_complete exactly once when the Plan stage
         # has advanced past ``"plan"`` (``"research"`` / ``"write"`` /
-        # ``"final"`` / ``"failed"``). A late-joining client (one that
-        # connects after the stage already advanced) sees it as its
-        # first event rather than a silent close — the event is the
-        # stage's handshake and the checkpointer makes it replayable.
-        # The ``"failed"`` path carries an empty topic list per the
-        # issue #9 API section (the dedicated ``error`` event lands in
-        # v0.5).
+        # ``"final"`` / ``"failed"``). ``"confirm"`` is deliberately
+        # excluded: it is the gate-open marker (issue #22), not a
+        # completion — firing here would tell the client the Plan
+        # stage is done while the user is still reviewing the topic
+        # list. The event fires only after the gate resumes and the
+        # gate node writes ``current_step="research"`` (issue #26).
+        # A late-joining client (one that connects after the stage
+        # already advanced) sees it as its first event rather than a
+        # silent close — the event is the stage's handshake and the
+        # checkpointer makes it replayable. The ``"failed"`` path
+        # carries an empty topic list per the issue #9 API section
+        # (the dedicated ``error`` event lands in v0.5).
         values = snapshot.values or {}
         current_step = values.get("current_step")
         research_topics = values.get("research_topics")
 
-        if not plan_complete_emitted and current_step not in (None, "plan"):
+        if not plan_complete_emitted and current_step not in (None, "plan", "confirm"):
             plan_complete_emitted = True
             topics = (
                 [] if current_step == "failed" else _research_topics_dict(research_topics)

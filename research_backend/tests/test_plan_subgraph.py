@@ -6,7 +6,9 @@ parent subgraph implement:
 - ``PLAN_MAX_ROUNDS`` is exported and equals 5.
 - The question-emit LLM is called on entry; if ``ready_to_proceed`` is
   true the node short-circuits to the topic-finalize LLM and writes
-  ``research_topics`` + ``current_step="research"``.
+  ``research_topics`` + ``current_step="confirm"`` — the gate-open
+  marker (v0.3 / issue #22; ``"research"`` is the gate's post-resume
+  write, not the finalize's).
 - When ``ready_to_proceed`` is false the node writes an assistant turn
   to ``messages`` and emits a ``PlanInterruptPayload`` (the interrupt
   itself is exercised in the e2e test, where the whole graph composes
@@ -228,6 +230,11 @@ def test_plan_questioner_finalizes_when_ready_to_proceed(patched_chat_model) -> 
     ``id`` to a fresh ``uuid4()`` (ADR-0005 §2) — the LLM-supplied
     ``topic-1`` slug is discarded. The assertion pins that behaviour:
     the id is a valid UUIDv4 and the LLM slug does NOT survive.
+
+    v0.3 (issue #26): the finalize writes ``current_step="confirm"`` —
+    the gate-open marker that sits between ``"plan"`` and ``"research"``
+    (parent #20 user-story #13). ``"research"`` is written by
+    ``confirm_plan_gate`` on resume only.
     """
     # Round 1 question-emit: ready_to_proceed=true with no questions.
     patched_chat_model.responses.append(
@@ -257,7 +264,7 @@ def test_plan_questioner_finalizes_when_ready_to_proceed(patched_chat_model) -> 
 
     delta = plan_questioner({"user_query": "Tell me about X", "round": 0}, config=None)
 
-    assert delta["current_step"] == "research"
+    assert delta["current_step"] == "confirm"
     assert len(delta["research_topics"]) == 1
     # uuid4() format — 8-4-4-4-12 hex with version nibble "4".
     import uuid as _uuid
@@ -295,7 +302,7 @@ def test_plan_questioner_skips_question_emit_at_soft_cap(patched_chat_model) -> 
         config=None,
     )
 
-    assert delta["current_step"] == "research"
+    assert delta["current_step"] == "confirm"
     assert len(patched_chat_model.responses) == 0  # topic-finalize consumed
     assert len(delta["research_topics"]) == 1
 
@@ -1044,11 +1051,106 @@ def test_gate_emits_confirm_interrupt_payload_after_finalize(
     assert len(payload.topics) == 2
 
 
-def test_gate_resume_with_same_list_writes_empty_diff(
+def test_gate_opens_after_plan_finalizes(
     memory_checkpointer, patched_chat_model
 ) -> None:
-    """The user confirms without edits — ``plan_edit_diff`` is all-empty and
-    ``confirmed_research_plan`` equals the LLM draft (ADR-0005 §6).
+    """Issue #26 AC — after 1 Q&A round + ``ready_to_proceed=true`` +
+    finalize, the gate opens and the paused state is unambiguous.
+
+    Drives the full gate-open path: round 1 emits one question (the
+    HITL round), the user answers, the resume re-run signals
+    ``ready_to_proceed=true`` so ``plan_questioner`` finalizes, and the
+    conditional edge routes into ``confirm_plan_gate`` whose
+    ``interrupt()`` pauses the subgraph.
+
+    ``get_state`` at the pause pins the three gate-open markers
+    (parent #20 user-story #13 / issue #22):
+
+    - ``current_step == "confirm"`` — the gate-open marker, distinct
+      from both a Plan-stage interrupt and the post-gate ``"research"``;
+    - the LLM draft is populated (``research_topics``);
+    - the user's list is NOT yet written (``confirmed_research_plan``
+      absent — it only lands after the gate resumes).
+    """
+    from app.graph.subgraphs.plan import build_plan_subgraph
+    from app.models import PlanAnswerBatch, PlanUserAnswer
+
+    # Round 1: one question, ready=false → the subgraph pauses at the
+    # questioner interrupt (the 1 Q&A round).
+    patched_chat_model.responses.append(
+        json.dumps(
+            {
+                "questions": [
+                    {
+                        "kind": "free_text",
+                        "id": "q1",
+                        "prompt": "What scope?",
+                        "placeholder": "e.g. last 5 years",
+                    }
+                ],
+                "reasoning": "scope",
+                "ready_to_proceed": False,
+            }
+        )
+    )
+    # Round 1 resume re-run: the questioner re-executes and now signals
+    # ready_to_proceed → finalize in the same entry.
+    patched_chat_model.responses.append(
+        json.dumps({"questions": [], "reasoning": "done", "ready_to_proceed": True})
+    )
+    # Topic-finalize: the LLM draft the gate will pause on.
+    patched_chat_model.responses.append(
+        json.dumps(
+            {
+                "topics": [
+                    _topic_dict(1, title="Scope"),
+                    _topic_dict(2, title="Evidence"),
+                ]
+            }
+        )
+    )
+
+    graph = build_plan_subgraph(checkpointer=memory_checkpointer)
+    config = {
+        "configurable": {"thread_id": "t-gate-opens"},
+        "recursion_limit": 25,
+    }
+
+    # 1. The 1 Q&A round — the subgraph pauses at the questioner.
+    out_1 = graph.invoke({"user_query": "Q?"}, config=config)
+    assert "__interrupt__" in out_1
+
+    # 2. The user answers; the resume re-run finalizes and the gate opens.
+    out_2 = graph.invoke(
+        Command(
+            resume=PlanAnswerBatch(
+                round=1, answers=[PlanUserAnswer(question_id="q1", value="last 5 years")]
+            )
+        ),
+        config=config,
+    )
+    assert "__interrupt__" in out_2
+    gate_payload = PlanConfirmInterruptPayload.model_validate(
+        out_2["__interrupt__"][0].value
+    )
+    assert len(gate_payload.topics) == 2
+
+    # 3. The paused state carries the three gate-open markers.
+    snapshot = graph.get_state(config)
+    values = snapshot.values
+    assert values["current_step"] == "confirm"
+    assert len(values["research_topics"]) == 2
+    assert "confirmed_research_plan" not in values
+    # The gate is the pending node — the subgraph has not ended.
+    assert snapshot.next == ("confirm_plan_gate",)
+
+
+def test_confirm_plan_resume_writes_confirmed_and_diff(
+    memory_checkpointer, patched_chat_model
+) -> None:
+    """Issue #26 AC — resume with the same list (no edits):
+    ``confirmed_research_plan == research_plan``, ``plan_edit_diff`` all
+    empty, ``current_step == "research"``.
 
     v0.3 (issue #23): the gate's draft topics carry ``uuid4()`` ids
     (ADR-0005 §2). The user submits those same ids; the empty-diff
@@ -1083,21 +1185,21 @@ def test_gate_resume_with_same_list_writes_empty_diff(
 
     assert "__interrupt__" not in final
     assert final["current_step"] == "research"
-    assert [t.id for t in final["confirmed_research_plan"]] == [
-        t.id for t in gate_payload.topics
-    ]
+    # The user's list IS the LLM draft — verbatim, not just id-wise.
+    assert final["confirmed_research_plan"] == final["research_topics"]
     diff = final["plan_edit_diff"]
     assert diff.added == []
     assert diff.removed == []
     assert diff.modified == []
 
 
-def test_gate_resume_with_edits_writes_diff(
+def test_confirm_plan_with_edits_writes_diff(
     memory_checkpointer, patched_chat_model
 ) -> None:
-    """A user edit (1 added + 1 removed + 1 modified) is reflected in the
-    ``PlanEditDiff`` audit trail and the ``confirmed_research_plan`` —
-    the values the Research subgraph will run on.
+    """Issue #26 AC — a user edit (1 added + 1 removed + 1 modified) is
+    reflected in the ``PlanEditDiff`` audit trail and the
+    ``confirmed_research_plan`` — the values the Research subgraph will
+    run on.
 
     v0.3 (issue #23): the gate's draft ids are ``uuid4()`` so the
     test keeps, modifies, or drops using those ids rather than the
@@ -1194,12 +1296,12 @@ def test_gate_resume_with_edits_writes_diff(
     assert plan_ids[2] != "topic-4"
 
 
-def test_gate_resume_with_empty_list_raises_value_error(
+def test_confirm_plan_with_empty_list_raises(
     memory_checkpointer, patched_chat_model
 ) -> None:
-    """An explicit empty topic list is rejected at the gate with
-    ``ValueError("EMPTY_PLAN")`` (ADR-0005 §4 — double defence: client
-    disables + server 400)."""
+    """Issue #26 AC — an explicit empty topic list is rejected at the gate
+    with ``ValueError("EMPTY_PLAN")`` (ADR-0005 §4 — double defence:
+    client disables + server 400)."""
     from app.graph.subgraphs.plan import build_plan_subgraph
     from app.models import ConfirmedResearchTopics
 
@@ -1297,12 +1399,23 @@ def test_plan_questioner_finalize_assigns_uuid4_ids(
     assert topics[0].id != topics[1].id
 
 
-def test_gate_resume_preserves_original_topic_ids(
+def test_topic_ids_are_stable_uuids(
     memory_checkpointer, patched_chat_model
 ) -> None:
-    """``diff_topics`` keys on the original draft ids (now UUIDv4). When
-    the user submits the same list, every entry is keyed by the same id
-    the gate just emitted — the audit trail has zero modifications."""
+    """Issue #26 AC — ``research_topics[*].id`` are valid UUIDv4, and a
+    resume that keeps a topic preserves its original id.
+
+    Two assertions in one pass (ADR-0005 §2):
+
+    - every id on the LLM draft (the gate's interrupt payload) parses
+      as a UUIDv4 — the ``_finalize_topics`` reassignment contract;
+    - the user edits one topic's ``title`` while keeping its id; the
+      final ``confirmed_research_plan`` still carries that same id, and
+      ``diff_topics`` records the pair under ``modified`` (same id,
+      different field) rather than ``added`` + ``removed``.
+    """
+    import uuid as _uuid
+
     from app.graph.subgraphs.plan import build_plan_subgraph
     from app.models import ConfirmedResearchTopics
 
@@ -1324,10 +1437,15 @@ def test_gate_resume_preserves_original_topic_ids(
     payload = out["__interrupt__"][0].value
     draft_ids = [t.id for t in payload.topics]
 
+    # Every draft id is a valid UUIDv4 (ADR-0005 §2).
+    for draft_id in draft_ids:
+        assert _uuid.UUID(draft_id).version == 4
+
+    # The user keeps both ids, editing only the first topic's title.
     final = graph.invoke(
         Command(resume=ConfirmedResearchTopics(
             topics=[
-                ResearchTopic(id=draft_ids[0], title="Scope",
+                ResearchTopic(id=draft_ids[0], title="Refined scope",
                               description="What topic 1 investigates",
                               expected_finding_type="evidence"),
                 ResearchTopic(id=draft_ids[1], title="Evidence",
@@ -1337,10 +1455,14 @@ def test_gate_resume_preserves_original_topic_ids(
         )),
         config=config,
     )
+    # The kept topics preserve their original ids across the gate.
+    assert [t.id for t in final["confirmed_research_plan"]] == draft_ids
     diff = final["plan_edit_diff"]
     assert diff.added == []
     assert diff.removed == []
-    assert diff.modified == []
+    assert [m.id for m in diff.modified] == [draft_ids[0]]
+    assert diff.modified[0].before.title == "Scope"
+    assert diff.modified[0].after.title == "Refined scope"
 
 
 def test_gate_node_is_no_llm(patched_chat_model, monkeypatch) -> None:

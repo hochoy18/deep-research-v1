@@ -252,8 +252,13 @@ def test_confirm_plan_preserves_topic_field_values(app_with_mock_graph) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_confirm_plan_returns_404_when_thread_unknown(app_with_mock_graph) -> None:
-    """A thread with no checkpoint raises 404."""
+def test_post_confirm_plan_with_unknown_thread_returns_404(app_with_mock_graph) -> None:
+    """Issue #26 AC — a thread with no checkpoint raises 404.
+
+    Mirrors ``test_api_answer.py``'s unknown-thread case: the resume
+    must never be attempted against a thread the checkpointer has
+    never seen.
+    """
     app, _ = app_with_mock_graph()
     client = TestClient(app)
 
@@ -338,8 +343,9 @@ def test_confirm_plan_returns_422_when_topic_missing_required_field(app_with_moc
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_confirm_plan_returns_400_when_topics_empty_client_side(app_with_mock_graph) -> None:
-    """API-layer defence-in-depth: an empty ``topics`` list short-circuits to 400 before invoking.
+def test_post_confirm_plan_with_empty_topics_returns_400(app_with_mock_graph) -> None:
+    """Issue #26 AC — API-layer defence-in-depth: an empty ``topics`` list
+    short-circuits to 400 before invoking.
 
     The client should already disable the "confirm" button when
     ``topics.length < 1`` (ADR-0005 §4). The API mirrors that guard so a
@@ -459,8 +465,10 @@ def test_confirm_plan_does_not_break_answer_route(app_with_mock_graph) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_confirm_plan_resumes_real_subgraph_end_to_end(monkeypatch) -> None:
-    """End-to-end: compiled plan subgraph + MemorySaver, gate resumed via the HTTP route.
+def test_post_confirm_plan_resumes_graph(monkeypatch) -> None:
+    """Issue #26 AC — end-to-end: compiled plan subgraph + MemorySaver, gate
+    resumed via the HTTP route; a subsequent ``GET /runs/{id}`` shows
+    the advanced state.
 
     Uses ``build_plan_subgraph`` (not ``build_graph``) so the test stays
     focused on the Plan→Research gate — the main graph would also call
@@ -586,7 +594,20 @@ def test_confirm_plan_resumes_real_subgraph_end_to_end(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == {"thread_id": thread_id, "accepted": True}
 
-    # 4. The subgraph's checkpointer now records the user's final list
+    # 4. Issue #26 AC — the advanced state is observable over HTTP, not
+    #    just via the checkpointer: ``GET /runs/{id}`` shows the step
+    #    moved past the gate and the user's final list landed.
+    state_response = client.get(f"/runs/{thread_id}")
+    assert state_response.status_code == 200
+    state_values = state_response.json()
+    assert state_values["current_step"] == "research"
+    assert len(state_values["confirmed_research_plan"]) == 1
+    assert state_values["confirmed_research_plan"][0]["title"] == draft_topic.title
+    assert state_values["plan_edit_diff"]["added"] == []
+    assert state_values["plan_edit_diff"]["removed"] == []
+    assert state_values["plan_edit_diff"]["modified"] == []
+
+    # 5. The subgraph's checkpointer now records the user's final list
     #    and the empty diff — confirms the resume wired through. With
     #    the same id the gate had on the draft, the diff is empty (no
     #    added / removed / modified entries).

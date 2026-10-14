@@ -21,11 +21,14 @@ from the start; the same question-emit LLM call runs again and yields
 the same batch, but ``interrupt()`` now returns the answer instead of
 raising. The node appends a Human turn to ``messages``, bumps ``round``,
 and writes ``last_answers``. The conditional edge after
-``plan_questioner`` then routes back to itself while
-``current_step != "research"`` — that loop body is the full HITL
-round. Once ``ready_to_proceed=true`` (or the soft cap is hit) the
-node finalizes (assigning each new topic a stable ``uuid4()`` id, per
-ADR-0005 §2) and the edge falls through to ``confirm_plan_gate``.
+``plan_questioner`` then routes back to itself while the gate has not
+opened (no ``"confirm"`` / ``"research"`` signal) — that loop body is
+the full HITL round. Once ``ready_to_proceed=true`` (or the soft cap
+is hit) the node finalizes (assigning each new topic a stable ``uuid4()`` id, per
+ADR-0005 §2), writes ``current_step="confirm"`` — the gate-open
+marker that sits between ``"plan"`` and ``"research"`` (issue #22 /
+parent #20 user-story #13) — and the edge falls through to
+``confirm_plan_gate``.
 
 The second node is ``confirm_plan_gate`` — the dumb pass-through gate
 between Plan and Research (ADR-0005 §1, issue #23). It is not an LLM
@@ -228,6 +231,13 @@ def _finalize_topics(user_query: str, messages: list[BaseMessage]) -> dict:
     the LLM's. Existing topics (carried over from a previous plan
     invocation against the same thread) keep their id; here all topics
     are freshly drafted so every id is a new ``uuid4()``.
+
+    ``current_step`` is written as ``"confirm"`` — the gate-open
+    marker (issue #22). The finalize itself has NOT completed the Plan
+    stage; the user still has to review / edit / confirm the list at
+    the gate. ``"research"`` is written by ``confirm_plan_gate`` on
+    resume only, so the SSE detector (issue #25) can distinguish a
+    gate-open pause from a genuinely completed Plan stage.
     """
     chat = llm_module.get_chat_model()
     user_text = _FINALIZE_USER_TEMPLATE.format(
@@ -262,7 +272,7 @@ def _finalize_topics(user_query: str, messages: list[BaseMessage]) -> dict:
 
     return {
         "research_topics": topics,
-        "current_step": "research",
+        "current_step": "confirm",
         "messages": messages,
     }
 
@@ -312,9 +322,10 @@ def confirm_plan_gate(state: PlanState, config) -> dict:
     ``plan_questioner._finalize_topics`` just wrote), wraps it in a
     ``PlanConfirmInterruptPayload``, and calls ``interrupt()`` —
     LangGraph raises ``GraphInterrupt`` here on the initial run and the
-    graph pauses. ``State`` at the pause point already carries
-    ``current_step="research"`` from ``plan_questioner``; the gate does
-    not touch ``current_step`` until the resume path runs.
+    graph pauses. ``State`` at the pause point carries
+    ``current_step="confirm"`` from ``plan_questioner``'s finalize —
+    the gate-open marker (issue #22). The gate does not touch
+    ``current_step`` until the resume path runs.
 
     On resume the user submits a typed ``ConfirmedResearchTopics`` via
     ``Command(resume=...)``. The node:
@@ -325,10 +336,10 @@ def confirm_plan_gate(state: PlanState, config) -> dict:
     2. computes the ``PlanEditDiff`` via ``diff_topics`` against the
        LLM draft that was paused (ADR-0005 §7);
     3. writes ``confirmed_research_plan``, ``plan_edit_diff``,
-       ``current_step="research"`` (already true from the questioner —
-       written again so the four-field return matches the AC and so the
-       step moves forward to the Research subgraph), and ``messages``
-       (no-op — preserved from the questioner's last write).
+       ``current_step="research"`` (the gate-open marker's successor —
+       the step advance that moves the pipeline into the Research
+       subgraph), and ``messages`` (no-op — preserved from the
+       questioner's last write).
 
     The node never invokes an LLM (ADR-0005 §1, user-story #9) and has
     no outgoing edge other than to ``END`` — there is no re-loop back
@@ -412,16 +423,16 @@ def _reassign_added_topic_ids(
 
 
 def _route_after_questioner(state: PlanState) -> Literal["plan_questioner", "confirm_plan_gate"]:
-    """Loop back into ``plan_questioner`` until the node signals 'research',
+    """Loop back into ``plan_questioner`` until the node signals the gate,
     then forward to ``confirm_plan_gate`` (issue #23 AC).
 
-    The Plan→Research transition gate sits between the questioner and
-    END so the routing condition is unchanged from v0.2 (still
-    ``current_step == "research"``); what changed is the destination
-    of that signal — instead of falling through to ``END``, it now
-    routes to the gate, which then has its own ``→ END`` edge.
+    v0.3 (issue #22 / #26): ``plan_questioner._finalize_topics`` writes
+    ``current_step="confirm"`` — the gate-open marker — so the forward
+    signal is ``"confirm"``. ``"research"`` is the gate's own post-resume
+    write and never appears while this router runs, so it is not (and
+    must not be) an accepted forward signal here.
     """
-    if state.get("current_step") == "research":
+    if state.get("current_step") == "confirm":
         return "confirm_plan_gate"
     return "plan_questioner"
 

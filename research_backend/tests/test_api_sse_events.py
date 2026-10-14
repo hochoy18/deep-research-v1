@@ -51,6 +51,7 @@ from app.api import events as events_module
 from app.api.events import stream_plan_events
 from app.api.routes import _build_config, router
 from app.models import (
+    PlanConfirmInterruptPayload,
     PlanInterruptPayload,
     ResearchTopic,
     SingleChoicePlanQuestion,
@@ -452,6 +453,116 @@ def test_plan_complete_emitted_with_empty_topics_on_failure(app_with_mock_graph)
     assert len(events) == 1
     assert events[0]["event"] == "plan_complete"
     assert events[0]["data"]["payload"] == {"research_topics": []}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Issue #26 — Plan→Research transition gate SSE contracts (mock-graph seam).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _gate_open_snapshot() -> tuple[list[ResearchTopic], _FakeSnapshot]:
+    """Build the draft topics + gate-open snapshot shared by the #26 tests.
+
+    The snapshot mirrors a real thread paused at the gate:
+    ``current_step == "confirm"`` (the gate-open marker — issue #22),
+    the gate as the pending node, and a ``PlanConfirmInterruptPayload``
+    interrupt carrying the LLM draft inline (ADR-0005 §5).
+    """
+    gate_topics = [
+        ResearchTopic(
+            id="topic-1", title="T1", description="d1", expected_finding_type="f1"
+        ),
+    ]
+    gate_interrupt = _FakeInterrupt(
+        id_="gate-1",
+        value=PlanConfirmInterruptPayload(
+            topics=gate_topics,
+            reasoning="Please review, edit, and confirm the research topics",
+        ),
+    )
+    snapshot = _FakeSnapshot(
+        values={"current_step": "confirm", "research_topics": gate_topics},
+        tasks=[_FakeTask(interrupts=[gate_interrupt])],
+        next=("confirm_plan_gate",),
+    )
+    return gate_topics, snapshot
+
+
+def test_plan_confirm_required_event_payload(app_with_mock_graph) -> None:
+    """Issue #26 AC — a gate-open snapshot (``current_step == "confirm"`` +
+    a ``PlanConfirmInterruptPayload`` interrupt) yields EXACTLY ONE
+    ``plan_confirm_required`` event carrying the inline
+    ``{topics, reasoning}`` payload (ADR-0005 §5).
+
+    "Exactly one" is load-bearing on both ends: the gate interrupt is
+    emitted once (dedup by interrupt id), and — because
+    ``"confirm"`` is the gate-open marker, not a completion — NO
+    ``plan_complete`` frame may fire while the user is still reviewing
+    the list. The plan stage only completes after the gate resumes and
+    ``current_step`` reaches ``"research"`` (see
+    ``test_plan_complete_fires_after_confirm``).
+    """
+    app, graph = app_with_mock_graph
+    _gate_topics, gate_open = _gate_open_snapshot()
+    # The trailing None (unknown/empty) closes the stream after the
+    # first poll so the mock-based test stays finite.
+    graph.scripts = [gate_open, None]
+
+    client = TestClient(app)
+    with client.stream("GET", "/runs/t-gate/events") as response:
+        events = _collect_sse_events(response)
+
+    assert [e["event"] for e in events] == ["plan_confirm_required"]
+    ev = events[0]
+    assert ev["data"]["thread_id"] == "t-gate"
+    assert isinstance(ev["data"]["ts"], int)
+    assert ev["data"]["payload"] == {
+        "topics": [
+            {
+                "id": "topic-1",
+                "title": "T1",
+                "description": "d1",
+                "expected_finding_type": "f1",
+            }
+        ],
+        "reasoning": "Please review, edit, and confirm the research topics",
+    }
+
+
+def test_plan_complete_fires_after_confirm(app_with_mock_graph) -> None:
+    """Issue #26 AC — the ordered pair: gate opens → user confirms → Plan
+    completes.
+
+    The scripted snapshot sequence mirrors a real thread: the first
+    poll sees the gate-open state (``"confirm"`` + the gate interrupt),
+    the second sees the post-confirm state (``"research"`` + the
+    subgraph at END). The wire order must be
+    ``plan_confirm_required`` then ``plan_complete`` — and nothing
+    in between: the completion handshake fires only once the user has
+    actually confirmed, so the client cannot mistake an open gate for
+    a finished Plan stage.
+    """
+    app, graph = app_with_mock_graph
+    gate_topics, gate_open = _gate_open_snapshot()
+    graph.scripts = [
+        gate_open,
+        # The user confirmed: gate resumed, step advanced, subgraph at
+        # END (no pending tasks, empty ``next``).
+        _FakeSnapshot(
+            values={"current_step": "research", "research_topics": gate_topics},
+            tasks=[],
+            next=(),
+        ),
+        None,
+    ]
+
+    client = TestClient(app)
+    with client.stream("GET", "/runs/t-confirm/events") as response:
+        events = _collect_sse_events(response)
+
+    assert [e["event"] for e in events] == ["plan_confirm_required", "plan_complete"]
+    # The completion payload carries the confirmed stage's topic list.
+    assert events[1]["data"]["payload"]["research_topics"][0]["title"] == "T1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -907,10 +1018,11 @@ async def test_real_plan_subgraph_completion_closes_stream(monkeypatch) -> None:
 
     paused = real_graph.invoke({"user_query": "Tell me about X"}, config=config)
     # v0.3 — the questioner finalizes into the gate; the subgraph
-    # pauses at the gate instead of reaching END.
-    assert paused["current_step"] == "research", (
-        "precondition: the standalone subgraph must have reached the "
-        "research step before the gate pauses"
+    # pauses at the gate instead of reaching END. The step at the pause
+    # is the gate-open marker "confirm" (issue #22 / #26).
+    assert paused["current_step"] == "confirm", (
+        "precondition: the subgraph must be paused at the gate-open "
+        "step before the resume drives it to END"
     )
     assert real_graph.get_state(config).next, (
         "precondition: the gate is paused (next must be non-empty)"
@@ -1023,7 +1135,7 @@ async def test_real_plan_subgraph_gate_pause_emits_plan_confirm_required(
     # questioner), so the SSE generator must surface the gate's
     # ``plan_confirm_required`` event with the draft topics.
     paused = real_graph.invoke({"user_query": "Tell me about X"}, config=config)
-    assert paused["current_step"] == "research"
+    assert paused["current_step"] == "confirm"
     assert real_graph.get_state(config).next, "gate must be paused"
 
     gate_paused = real_graph.get_state(config)
@@ -1048,11 +1160,13 @@ async def test_real_plan_subgraph_gate_pause_emits_plan_confirm_required(
         )
     ]
 
-    # Two events from the same snapshot: the gate interrupt
-    # (plan_confirm_required) and the plan_complete handshake
-    # (current_step is "research"). The generator walks tasks before
-    # current_step, so the gate event comes first.
-    assert len(chunks) == 2, f"expected 2 frames, got {chunks!r}"
+    # One event from the gate-open snapshot: the gate interrupt
+    # (``plan_confirm_required``). ``current_step`` is ``"confirm"`` —
+    # the gate-open marker, NOT a completion — so no ``plan_complete``
+    # frame may fire while the user is still reviewing the list (the
+    # handshake lands only after the gate resumes; see
+    # ``test_plan_complete_fires_after_confirm``).
+    assert len(chunks) == 1, f"expected 1 frame, got {chunks!r}"
     confirm_frame = chunks[0].decode("utf-8")
     assert confirm_frame.startswith("event: plan_confirm_required\ndata: ")
     assert confirm_frame.endswith("\n\n")

@@ -1,5 +1,6 @@
 """HTTP routes — health, run creation, run inspection, plan answer resume (issue #13),
-and the Plan-stage SSE event stream (issue #14).
+the Plan→Research transition gate resume (issue #24), and the Plan-stage SSE event
+stream (issue #14).
 """
 
 from __future__ import annotations
@@ -9,12 +10,12 @@ import uuid
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from app.api.events import stream_plan_events
-from app.models import PlanAnswerBatch, PlanUserAnswer
+from app.models import ConfirmedResearchTopics, PlanAnswerBatch, PlanUserAnswer
 from app.nodes.research_run import RECURSION_LIMIT
 
 router = APIRouter()
@@ -75,11 +76,11 @@ def _to_jsonable(value: Any) -> Any:
 def _get_graph_or_503(request: Request):
     """Return the compiled graph bound to ``app.state``, or raise 503.
 
-    All four graph-backed routes (``create_run``, ``get_run``,
-    ``answer_run``, ``stream_run_events``) need the same lifespan guard —
-    a missing graph means the FastAPI lifespan handler has not run (e.g.
-    in tests that bypass ``app.state.graph`` assignment). Centralising
-    here keeps the error message in one place.
+    All five graph-backed routes (``create_run``, ``get_run``,
+    ``answer_run``, ``confirm_plan``, ``stream_run_events``) need the
+    same lifespan guard — a missing graph means the FastAPI lifespan
+    handler has not run (e.g. in tests that bypass ``app.state.graph``
+    assignment). Centralising here keeps the error message in one place.
     """
     graph = request.app.state.graph
     if graph is None:  # pragma: no cover — only when lifespan hasn't run
@@ -90,14 +91,16 @@ def _get_graph_or_503(request: Request):
 def _get_state_or_404(graph, config: dict[str, Any]):
     """Return the checkpoint snapshot for ``config``, or raise 404.
 
-    ``get_run`` and ``answer_run`` need the same thread-existence guard.
-    A missing thread shows up in two shapes: ``get_state`` returns
-    ``None``, or — what ``MemorySaver`` does — a ``StateSnapshot`` whose
-    ``values`` is an empty dict. Both mean "nothing to act on", so the
-    falsy check must cover them; otherwise a resume against an unknown
-    thread falls through to ``graph.invoke`` and crashes in
-    ``plan_questioner`` with ``user_query is empty``. Centralising here
-    keeps the error message in one place (see ``_get_graph_or_503``).
+    ``get_run``, ``answer_run`` and ``confirm_plan`` need the same
+    thread-existence guard. A missing thread shows up in two shapes:
+    ``get_state`` returns ``None``, or — what ``MemorySaver`` does — a
+    ``StateSnapshot`` whose ``values`` is an empty dict. Both mean
+    "nothing to act on", so the falsy check must cover them; otherwise a
+    resume against an unknown thread falls through to ``graph.invoke``
+    and crashes in ``plan_questioner`` with ``user_query is empty``
+    (or in ``confirm_plan_gate`` — issue #23 — which raises
+    ``RuntimeError("state has no research_topics")``). Centralising
+    here keeps the error message in one place (see ``_get_graph_or_503``).
     """
     snapshot = graph.get_state(config)
     if snapshot is None or not snapshot.values:
@@ -116,6 +119,11 @@ def _mark_run_failed(graph, config: dict[str, Any]) -> None:
     fixes the final frame as ``plan_complete`` with empty topics).
     Best-effort: if the checkpointer itself is down there is no stream
     to notify, and the original raise still surfaces.
+
+    Not called for user-side rejections (e.g. the ``EMPTY_PLAN`` path in
+    ``confirm_plan`` — issue #24): those are not pipeline failures and
+    must not surface as ``current_step="failed"`` to an open event
+    stream.
 
     Schema caveat: ``update_state`` filters writes through the graph's
     input schema — the main graph's ``State`` accepts ``current_step``
@@ -190,6 +198,94 @@ async def answer_run(
         _mark_run_failed(graph, config)
         raise
     return AnswerAcceptedResponse(thread_id=thread_id)
+
+
+@router.post("/runs/{thread_id}/confirm-plan", response_model=AnswerAcceptedResponse)
+async def confirm_plan(
+    thread_id: str,
+    payload: ConfirmedResearchTopics,
+    request: Request,
+) -> AnswerAcceptedResponse:
+    """Resume the Plan→Research transition gate from its ``interrupt()`` pause (issue #24).
+
+    The gate node ``confirm_plan_gate`` (issue #23) sits between
+    ``plan_questioner`` and ``END`` inside the plan subgraph. Once the
+    questioner has finalized ``research_topics``, the gate pauses on a
+    typed ``PlanConfirmInterruptPayload`` and waits for the user's
+    final topic list. This endpoint is the only mechanism that drives
+    that pause forward.
+
+    The body is validated as ``ConfirmedResearchTopics`` (issue #21) —
+    a missing ``topics`` field is a Pydantic 422 (FastAPI rejects it
+    before the handler runs). An explicit empty list is rejected at
+    the API layer with 400 + code ``EMPTY_PLAN`` (ADR-0005 §4) so the
+    gate is never reached on a payload that would fail anyway. The
+    gate's own ``ValueError("EMPTY_PLAN")`` raise (issue #23) is also
+    caught and mapped to the same 400 envelope as the server-side
+    defence-in-depth — the client sees one error contract regardless
+    of which side caught it.
+
+    On success the route returns the same ``AnswerAcceptedResponse``
+    envelope as ``POST /runs/{thread_id}/answer`` so the client can
+    correlate the gate resume with the run. The actual
+    ``confirmed_research_plan`` and ``plan_edit_diff`` are written by
+    the gate node itself (issue #23) and surfaced via
+    ``GET /runs/{thread_id}`` (ADR-0005 §6).
+
+    The ``answer`` and ``confirm-plan`` endpoints are intentionally
+    orthogonal (ADR-0005): Plan Q&A and the Plan→Research gate are two
+    different user actions, not a single flow.
+    """
+    graph = _get_graph_or_503(request)
+    config = _build_config(thread_id)
+    _get_state_or_404(graph, config)  # 404 before any resume attempt
+
+    # Client-side defence-in-depth (ADR-0005 §4): the front end already
+    # disables the "confirm" button when ``topics.length < 1``; the API
+    # mirrors that guard so a misbehaving client cannot advance an empty
+    # plan. Short-circuit before invoking the graph so no state is
+    # written.
+    if not payload.topics:
+        return _empty_plan_response()
+
+    try:
+        graph.invoke(Command(resume=payload), config=config)
+    except ValueError as exc:
+        # Server-side defence-in-depth (ADR-0005 §4): the gate node
+        # (``confirm_plan_gate`` — issue #23) raises
+        # ``ValueError("EMPTY_PLAN")`` for an empty list as its second
+        # guard. Both paths converge on the same 400 body so the client
+        # has one error contract. ``_mark_run_failed`` is intentionally
+        # NOT called — an empty plan is a user error, not a pipeline
+        # failure (ADR-0008 fast-fail does not apply), and writing
+        # ``current_step="failed"`` would surface a spurious terminal
+        # frame on any open ``GET /runs/{id}/events`` stream.
+        if str(exc) == "EMPTY_PLAN":
+            return _empty_plan_response()
+        raise
+    except Exception:
+        _mark_run_failed(graph, config)
+        raise
+    return AnswerAcceptedResponse(thread_id=thread_id)
+
+
+def _empty_plan_response() -> JSONResponse:
+    """Build the 400 body for an empty ``topics`` list (ADR-0005 §4).
+
+    Returns ``{"detail": "Empty topic list rejected", "code": "EMPTY_PLAN"}``
+    with ``status_code=400`` — top-level ``detail`` and ``code`` keys,
+    not the default FastAPI ``{"detail": ...}`` wrapper. Used by both
+    the client-side short-circuit and the server-side
+    ``ValueError("EMPTY_PLAN")`` catch so the body shape is identical
+    regardless of which path triggered.
+    """
+    return JSONResponse(
+        status_code=400,
+        content={
+            "detail": "Empty topic list rejected",
+            "code": "EMPTY_PLAN",
+        },
+    )
 
 
 @router.get("/runs/{thread_id}/events")

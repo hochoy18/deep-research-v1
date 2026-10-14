@@ -4,8 +4,8 @@ These two tests pin the two acceptance criteria called out in issue #16:
 
 - ``test_sse_emits_plan_question_and_plan_complete`` — a scripted 2-round
   Q&A run yields exactly 2 ``plan_question`` events + 1 ``plan_complete``
-  event in that order, with each ``data`` parsing as JSON shaped as
-  ``{thread_id, ts, payload}``.
+  event + 1 ``plan_confirm_required`` event in that order, with each
+  ``data`` parsing as JSON shaped as ``{thread_id, ts, payload}``.
 - ``test_sse_envelope_format`` — each event is rendered as the literal
   byte sequence ``event: <name>\ndata: <json>\n\n`` (matching what
   ``curl -N`` would print).
@@ -15,16 +15,26 @@ Both tests drive the real ``plan_subgraph`` compiled with ``MemorySaver``
 real LLM is called, no real network is touched, the v0.1 test suite
 continues to pass.
 
+In v0.3 the questioner finalizes into the Plan→Research transition gate
+(ADR-0005, issue #23) which interrupts again with
+``PlanConfirmInterruptPayload``. The tests therefore drive an extra
+``graph.invoke(Command(resume=ConfirmedResearchTopics(...)))`` after
+the questioner finalizes so the gate completes and the graph reaches
+END — the SSE generator's ``not snapshot.next`` close signal only
+fires once the subgraph leaves the gate. There is no ``/confirm``
+HTTP endpoint yet (issue #24) so the tests use the graph instance
+they already wired onto ``app.state.graph`` to drive the resume.
+
 The SSE consumer runs in a worker thread so it observes the in-flight
-``interrupt()`` state transitions (round 1 → round 2 → final), not just
-the late-join replay (which only ever replays ``plan_complete`` once
-the stage has already advanced). The graph is driven to END on each
-test so the SSE generator observes the ``next=()`` close signal and
-shuts down — ``TestClient.stream`` deadlocks on infinite-poll streams
-because Starlette's TestClient only yields ``http.disconnect`` after
-the response body finishes (see the long docstring in
-``test_api_sse_events.py`` for the same constraint), so a finite, graph
-finalized, stream is a hard requirement under TestClient.
+``interrupt()`` state transitions (round 1 → round 2 → final → gate),
+not just the late-join replay (which only ever replays ``plan_complete``
+once the stage has already advanced). The graph is driven to END on
+each test so the SSE generator observes the ``next=()`` close signal
+and shuts down — ``TestClient.stream`` deadlocks on infinite-poll
+streams because Starlette's TestClient only yields ``http.disconnect``
+after the response body finishes (see the long docstring in
+``test_api_sse_events.py`` for the same constraint), so a finite,
+graph finalized, stream is a hard requirement under TestClient.
 """
 
 from __future__ import annotations
@@ -38,10 +48,12 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from langgraph.types import Command
 
 from app.api import events as events_module
 from app.api.routes import router
 from app.graph.subgraphs.plan import build_plan_subgraph
+from app.models import ConfirmedResearchTopics
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fixtures + helpers.
@@ -129,7 +141,7 @@ def _split_sse_frames(raw: bytes) -> list[dict[str, Any]]:
 
 
 def test_sse_emits_plan_question_and_plan_complete(patched_chat_model, memory_checkpointer) -> None:
-    """Scripted 2-round Q&A run yields exactly 2 plan_question + 1 plan_complete.
+    """Scripted 2-round Q&A run yields 2 plan_question + 1 plan_complete + 1 plan_confirm_required.
 
     Flows through the standard questioner cadence — on entry AND on
     resume the questioner LLM is re-run, so the run consumes 6 LLM
@@ -138,7 +150,16 @@ def test_sse_emits_plan_question_and_plan_complete(patched_chat_model, memory_ch
     ``test_plan_subgraph_routes_back_until_research_step`` shape). The
     SSE consumer runs in a worker thread so it observes both
     ``interrupt()`` pauses (round 1 then round 2) plus the
-    ``current_step="research"`` finalize handshake.
+    ``current_step="research"`` finalize handshake plus the gate's
+    ``plan_confirm_required`` interrupt.
+
+    v0.3 adds the Plan→Research transition gate (issue #23): after the
+    questioner finalizes, the gate reads ``research_topics`` and
+    pauses again. The test drives the gate resume by calling the
+    graph directly with ``Command(resume=ConfirmedResearchTopics(...))``
+    — there is no ``/confirm`` HTTP endpoint yet (issue #24) but the
+    test already has the compiled graph on ``app.state.graph`` so it
+    can reach the seam without an extra route.
     """
     # The questioner LLM re-runs on every entry AND on every resume,
     # so each round consumes two LLM calls with the SAME batch
@@ -181,6 +202,7 @@ def test_sse_emits_plan_question_and_plan_complete(patched_chat_model, memory_ch
     )
 
     app = _build_app(memory_checkpointer)
+    graph = app.state.graph  # so the test can drive the gate directly
 
     # 1. POST /runs — graph pauses at interrupt #1 (round 1).
     client = TestClient(app)
@@ -213,15 +235,34 @@ def test_sse_emits_plan_question_and_plan_complete(patched_chat_model, memory_ch
     # 4. POST /answer #2 — resume, questioner re-runs with the same
     #    Q2 batch (ready=false), interrupt returns the answer, the
     #    loop continues, the questioner emits ready=true, finalize
-    #    runs, and the subgraph lands at END with
-    #    current_step="research".
+    #    runs, and the subgraph pauses at the gate (v0.3 — issue
+    #    #23) — ``current_step="research"`` has been written but the
+    #    gate now sits between the questioner and END.
     response = client.post(
         f"/runs/{thread_id}/answer",
         json={"answers": [{"question_id": "q2", "value": True}]},
     )
     assert response.status_code == 200, response.text
+    time.sleep(0.1)
 
-    # 5. Wait for the SSE worker to finish (graph at END → SSE
+    # 5. Drive the gate resume directly — there is no /confirm endpoint
+    #    yet (issue #24). The test wires the gate's draft topics back
+    #    unchanged so ``diff_topics`` returns an empty edit set; the
+    #    point is to advance the subgraph to END so the SSE stream
+    #    closes. The IDs match the LLM's draft verbatim; the gate
+    #    re-assigns uuid4() to fresh topics but a no-op user edit
+    #    here is intentional — this test is about the SSE wire
+    #    contract, not the gate's diff logic (covered in test_utils
+    #    + test_plan_subgraph).
+    paused = graph.get_state({"configurable": {"thread_id": thread_id}})
+    gate_payload = paused.tasks[0].interrupts[0].value
+    assert gate_payload.topics[0].title == "T1"
+    graph.invoke(
+        Command(resume=ConfirmedResearchTopics(topics=list(gate_payload.topics))),
+        config={"configurable": {"thread_id": thread_id}},
+    )
+
+    # 6. Wait for the SSE worker to finish (graph at END → SSE
     #    generator returns on ``not snapshot.next``; ``iter_bytes``
     #    exhausts; ``client.stream`` exits its context manager; the
     #    worker function returns).
@@ -235,13 +276,20 @@ def test_sse_emits_plan_question_and_plan_complete(patched_chat_model, memory_ch
     raw = b"".join(collected)
     events = _split_sse_frames(raw)
 
-    # AC1 — exactly two ``plan_question`` events + one ``plan_complete``
-    # event, in that order (the SSE dedupe key is the LangGraph
+    # AC1 — exactly two ``plan_question`` events, one
+    # ``plan_confirm_required`` event, and one ``plan_complete``
+    # event, in that order. The SSE dedupe key is the LangGraph
     # ``Interrupt.id``; each new ``interrupt()`` call gets a fresh id,
-    # so the two rounds emit two events).
+    # so the two questioner rounds and the gate each emit one event.
+    # Order rationale: the generator walks ``snapshot.tasks`` (the
+    # gate interrupt) BEFORE it checks ``current_step`` for the
+    # ``plan_complete`` handshake, so a paused gate surfaces the
+    # gate event ahead of the handshake even though both are present
+    # in the same snapshot. The handshake is the final close signal.
     assert [e["event"] for e in events] == [
         "plan_question",
         "plan_question",
+        "plan_confirm_required",
         "plan_complete",
     ], f"unexpected event sequence (raw stream={raw!r})"
 
@@ -258,12 +306,20 @@ def test_sse_emits_plan_question_and_plan_complete(patched_chat_model, memory_ch
     # Spot-check the typed payload survives end-to-end: round indices
     # and the topic id flow from the LLM-scripted JSON through the
     # checkpointer to the SSE bytes without being normalised away.
-    plan_question_1, plan_question_2, plan_complete = events
+    plan_question_1, plan_question_2, plan_confirm, plan_complete = events
     assert plan_question_1["data"]["payload"]["round"] == 1
     assert plan_question_1["data"]["payload"]["questions"][0]["id"] == "q1"
     assert plan_question_2["data"]["payload"]["round"] == 2
     assert plan_question_2["data"]["payload"]["questions"][0]["id"] == "q2"
-    assert plan_complete["data"]["payload"]["research_topics"][0]["id"] == "topic-1"
+    # Gate payload carries the topic draft (uuid4-assigned by
+    # ``plan_questioner._finalize_topics``) plus the gate's standard
+    # reasoning copy. The topic id is a uuid4, not the LLM's
+    # ``topic-1`` slug — see ADR-0005 §2.
+    assert plan_confirm["data"]["payload"]["reasoning"] == (
+        "Please review, edit, and confirm the research topics"
+    )
+    assert plan_confirm["data"]["payload"]["topics"][0]["title"] == "T1"
+    assert plan_complete["data"]["payload"]["research_topics"][0]["title"] == "T1"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,10 +331,11 @@ def test_sse_envelope_format(patched_chat_model, memory_checkpointer) -> None:
     """Each event is rendered as ``event: <name>\\ndata: <json>\\n\\n``.
 
     Single-round Q&A so the SSE generator observes one ``plan_question``
-    + one ``plan_complete`` in a single finite stream. The assertion is
-    on the raw bytes — no JSON parser involved in the byte-shape check
-    — so any divergence in line layout, whitespace, or framing
-    separators surfaces as a regex mismatch.
+    + one ``plan_complete`` + one ``plan_confirm_required`` in a single
+    finite stream. The assertion is on the raw bytes — no JSON parser
+    involved in the byte-shape check — so any divergence in line
+    layout, whitespace, or framing separators surfaces as a regex
+    mismatch.
     """
     # Four LLM responses for the 1-round Q&A flow (1 + 3 across
     # ``POST /runs`` and the single ``POST /runs/{id}/answer`` call —
@@ -314,6 +371,7 @@ def test_sse_envelope_format(patched_chat_model, memory_checkpointer) -> None:
     patched_chat_model.responses.extend([q_format_batch, q_format_batch, ready_batch, topics_batch])
 
     app = _build_app(memory_checkpointer)
+    graph = app.state.graph  # drive the gate directly (no /confirm endpoint yet)
 
     client = TestClient(app)
     response = client.post("/runs", json={"user_query": "Tell me about Y"})
@@ -325,15 +383,26 @@ def test_sse_envelope_format(patched_chat_model, memory_checkpointer) -> None:
     sse_thread.start()
     time.sleep(0.1)
 
-    # Resume → next-round ready=true → finalize → END. The SSE
-    # generator will then observe ``plan_question`` (round 1),
-    # ``plan_complete`` (current_step="research"), and close on
-    # ``next=()``.
+    # Resume → next-round ready=true → finalize → gate pauses (v0.3).
+    # The SSE generator observes ``plan_question`` (round 1),
+    # ``plan_complete`` (current_step="research" — written by
+    # ``plan_questioner._finalize_topics`` BEFORE the gate runs), and
+    # ``plan_confirm_required`` (gate interrupt). Driving the gate
+    # resume below is what closes the stream.
     response = client.post(
         f"/runs/{thread_id}/answer",
         json={"answers": [{"question_id": "q-format", "value": "a"}]},
     )
     assert response.status_code == 200, response.text
+    time.sleep(0.1)
+
+    # Drive the gate resume directly so the subgraph reaches END.
+    paused = graph.get_state({"configurable": {"thread_id": thread_id}})
+    gate_payload = paused.tasks[0].interrupts[0].value
+    graph.invoke(
+        Command(resume=ConfirmedResearchTopics(topics=list(gate_payload.topics))),
+        config={"configurable": {"thread_id": thread_id}},
+    )
 
     sse_thread.join(timeout=10)
     assert not sse_thread.is_alive(), (
@@ -357,11 +426,15 @@ def test_sse_envelope_format(patched_chat_model, memory_checkpointer) -> None:
     # Splitting on ``\n\n`` should give exactly one frame per event
     # plus a trailing empty entry (which the ``if not frame`` filter
     # drops). Any additional non-empty frames would mean a duplicate
-    # emission or a malformed frame.
+    # emission or a malformed frame. Three frames here: round-1
+    # question, the gate's plan_confirm_required, and the
+    # plan_complete handshake (gate pauses with the research
+    # step already written, so both events are observable in the
+    # same snapshot — generator walks tasks before current_step).
     frames = [f for f in raw.split(b"\n\n") if f]
-    assert len(frames) == 2, (
-        f"expected exactly 2 SSE frames (one of each event type), got "
-        f"{len(frames)} (raw stream={raw!r})"
+    assert len(frames) == 3, (
+        f"expected exactly 3 SSE frames (plan_question + plan_confirm_required "
+        f"+ plan_complete), got {len(frames)} (raw stream={raw!r})"
     )
 
     # Each frame is exactly two lines: ``event: <name>\n`` + ``data: <json>\n``,
@@ -380,7 +453,7 @@ def test_sse_envelope_format(patched_chat_model, memory_checkpointer) -> None:
         )
         event_name = match.group(1).decode("utf-8")
         data_bytes = match.group(2)
-        assert event_name in {"plan_question", "plan_complete"}, (
+        assert event_name in {"plan_question", "plan_complete", "plan_confirm_required"}, (
             f"unexpected event name {event_name!r}"
         )
 
@@ -394,8 +467,8 @@ def test_sse_envelope_format(patched_chat_model, memory_checkpointer) -> None:
         assert isinstance(envelope["ts"], int)
         assert isinstance(envelope["payload"], dict)
 
-    # The first frame is ``plan_question`` (round 1 interrupt), the
-    # second is ``plan_complete`` (round 3 finalize) — the order is
-    # part of the SSE contract too.
+    # The order is part of the SSE contract too: questioner
+    # interrupt → gate interrupt → plan_complete handshake.
     assert frames[0].startswith(b"event: plan_question\n")
-    assert frames[1].startswith(b"event: plan_complete\n")
+    assert frames[1].startswith(b"event: plan_confirm_required\n")
+    assert frames[2].startswith(b"event: plan_complete\n")

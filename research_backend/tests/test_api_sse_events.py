@@ -861,9 +861,131 @@ async def test_real_plan_subgraph_completion_closes_stream(monkeypatch) -> None:
     failure path (where ``next`` stays non-empty after the failing
     node — see ``test_graph_failure_writes_failed_state_and_finalizes_the_stream``).
 
+    In v0.3 the questioner finalizes into the Plan→Research transition
+    gate (ADR-0005, issue #23), so the subgraph pauses at the gate
+    instead of reaching END after ``ready_to_proceed=true``. The test
+    drives the gate resume via ``Command(resume=ConfirmedResearchTopics(...))``
+    so the standalone subgraph lands at END and the close signal
+    fires — this test pins the close signal, NOT the gate event
+    shape (the gate event is covered by the unit test below).
+
     ``asyncio.timeout(2.0)`` converts the hang into a real
     ``TimeoutError``; without the timeout the test deadlocks
     ``async for`` instead of failing, and pytest can't report a verdict.
+    """
+    from app.graph.subgraphs.plan import build_plan_subgraph
+    from app.models import ConfirmedResearchTopics
+    from app.tools import llm
+
+    topics_payload = {
+        "topics": [
+            {
+                "id": "topic-1",
+                "title": "T1",
+                "description": "d1",
+                "expected_finding_type": "f1",
+            }
+        ]
+    }
+    stub_chat = _StubChat(
+        [
+            json.dumps(
+                {
+                    "questions": [],
+                    "reasoning": "Have enough; ready to plan.",
+                    "ready_to_proceed": True,
+                }
+            ),
+            json.dumps(topics_payload),
+        ]
+    )
+    monkeypatch.setattr(llm, "get_chat_model", lambda: stub_chat)
+
+    real_graph = build_plan_subgraph(MemorySaver())
+    thread_id = str(uuid.uuid4())
+    config = _build_config(thread_id)
+
+    paused = real_graph.invoke({"user_query": "Tell me about X"}, config=config)
+    # v0.3 — the questioner finalizes into the gate; the subgraph
+    # pauses at the gate instead of reaching END.
+    assert paused["current_step"] == "research", (
+        "precondition: the standalone subgraph must have reached the "
+        "research step before the gate pauses"
+    )
+    assert real_graph.get_state(config).next, (
+        "precondition: the gate is paused (next must be non-empty)"
+    )
+
+    # Drive the gate resume — the gate's draft topics are what
+    # ``plan_questioner._finalize_topics`` just wrote. A no-op
+    # confirm (the user accepts the draft unchanged) keeps the diff
+    # empty and the test focused on the close signal.
+    from langgraph.types import Command
+
+    gate_payload = real_graph.get_state(config).tasks[0].interrupts[0].value
+    real_graph.invoke(
+        Command(resume=ConfirmedResearchTopics(topics=list(gate_payload.topics))),
+        config=config,
+    )
+    # Sanity — the subgraph is at END; this is the close signal the
+    # fix relies on.
+    assert real_graph.get_state(config).next == ()
+
+    class _NeverDisconnects:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    chunks: list[bytes] = []
+    try:
+        async with asyncio.timeout(2.0):
+            async for c in stream_plan_events(
+                _NeverDisconnects(), real_graph, config, thread_id
+            ):
+                chunks.append(c)
+    except TimeoutError:
+        pytest.fail(
+            "SSE stream did not close for a completed standalone plan "
+            "subgraph within 2s — stream_plan_events must close on "
+            "`not snapshot.next` (graph at END), not just on "
+            "`current_step in ('final', 'failed')`."
+        )
+
+    # One plan_complete frame with the topics the finalizer produced.
+    # The poll happens AFTER the gate is confirmed and the subgraph
+    # is at END, so the gate interrupt is no longer in the snapshot;
+    # the only observable event is the plan_complete handshake on
+    # the research step. (The gate event itself is covered by
+    # ``test_real_plan_subgraph_gate_pause_emits_plan_confirm_required``
+    # below, which polls while the gate is paused.)
+    assert len(chunks) == 1, f"expected exactly one plan_complete frame, got {chunks!r}"
+    frame = chunks[0].decode("utf-8")
+    assert frame.startswith("event: plan_complete\ndata: ")
+    assert frame.endswith("\n\n")
+    envelope = json.loads(frame.split("data: ", 1)[1].split("\n\n", 1)[0])
+    assert envelope["thread_id"] == thread_id
+    assert envelope["payload"]["research_topics"][0]["title"] == "T1"
+
+
+@pytest.mark.asyncio
+async def test_real_plan_subgraph_gate_pause_emits_plan_confirm_required(
+    monkeypatch,
+) -> None:
+    """A standalone plan subgraph paused at the gate emits ``plan_confirm_required``.
+
+    Companion to ``test_real_plan_subgraph_pause_emits_plan_question``:
+    the questioner interrupt is ``plan_question`` (issue #14), the
+    gate interrupt is ``plan_confirm_required`` (issue #25). The two
+    share the same ``Interrupt`` channel so the SSE generator has to
+    discriminate by payload shape (the gate carries ``topics``, the
+    questioner carries ``questions``) — that discrimination is what
+    this test pins against the real LangGraph primitives + checkpointer
+    round-trip.
+
+    The test drives the generator directly rather than via
+    ``TestClient.stream`` because a still-paused (never-terminating)
+    stream deadlocks Starlette's TestClient (see the module
+    docstring). A small ``_NeverDisconnects`` fake keeps the loop
+    running until the disconnect stub's check kicks in.
     """
     from app.graph.subgraphs.plan import build_plan_subgraph
     from app.tools import llm
@@ -896,41 +1018,62 @@ async def test_real_plan_subgraph_completion_closes_stream(monkeypatch) -> None:
     thread_id = str(uuid.uuid4())
     config = _build_config(thread_id)
 
-    final = real_graph.invoke({"user_query": "Tell me about X"}, config=config)
-    assert final["current_step"] == "research", (
-        "precondition: the standalone subgraph must have finalised"
+    # Drive the questioner to ``ready_to_proceed=true`` → finalize →
+    # gate pause. The subgraph is paused at the gate (not at the
+    # questioner), so the SSE generator must surface the gate's
+    # ``plan_confirm_required`` event with the draft topics.
+    paused = real_graph.invoke({"user_query": "Tell me about X"}, config=config)
+    assert paused["current_step"] == "research"
+    assert real_graph.get_state(config).next, "gate must be paused"
+
+    gate_paused = real_graph.get_state(config)
+    from app.models import PlanConfirmInterruptPayload
+
+    assert isinstance(
+        gate_paused.tasks[0].interrupts[0].value, PlanConfirmInterruptPayload
     )
-    # Sanity — the subgraph is at END; this is the close signal the
-    # fix relies on.
-    assert real_graph.get_state(config).next == ()
 
-    class _NeverDisconnects:
+    class _DisconnectAfterFirstPoll:
+        def __init__(self) -> None:
+            self.checks = 0
+
         async def is_disconnected(self) -> bool:
-            return False
+            self.checks += 1
+            return self.checks > 1
 
-    chunks: list[bytes] = []
-    try:
-        async with asyncio.timeout(2.0):
-            async for c in stream_plan_events(
-                _NeverDisconnects(), real_graph, config, thread_id
-            ):
-                chunks.append(c)
-    except TimeoutError:
-        pytest.fail(
-            "SSE stream did not close for a completed standalone plan "
-            "subgraph within 2s — stream_plan_events must close on "
-            "`not snapshot.next` (graph at END), not just on "
-            "`current_step in ('final', 'failed')`."
+    chunks = [
+        c
+        async for c in stream_plan_events(
+            _DisconnectAfterFirstPoll(), real_graph, config, thread_id
         )
+    ]
 
-    # One plan_complete frame with the topics the finalizer produced.
-    assert len(chunks) == 1, f"expected exactly one plan_complete frame, got {chunks!r}"
-    frame = chunks[0].decode("utf-8")
-    assert frame.startswith("event: plan_complete\ndata: ")
-    assert frame.endswith("\n\n")
-    envelope = json.loads(frame.split("data: ", 1)[1].split("\n\n", 1)[0])
-    assert envelope["thread_id"] == thread_id
-    assert envelope["payload"]["research_topics"][0]["id"] == "topic-1"
+    # Two events from the same snapshot: the gate interrupt
+    # (plan_confirm_required) and the plan_complete handshake
+    # (current_step is "research"). The generator walks tasks before
+    # current_step, so the gate event comes first.
+    assert len(chunks) == 2, f"expected 2 frames, got {chunks!r}"
+    confirm_frame = chunks[0].decode("utf-8")
+    assert confirm_frame.startswith("event: plan_confirm_required\ndata: ")
+    assert confirm_frame.endswith("\n\n")
+    confirm_envelope = json.loads(
+        confirm_frame.split("data: ", 1)[1].split("\n\n", 1)[0]
+    )
+    assert confirm_envelope["thread_id"] == thread_id
+    assert isinstance(confirm_envelope["ts"], int)
+    assert confirm_envelope["payload"]["reasoning"] == (
+        "Please review, edit, and confirm the research topics"
+    )
+    assert confirm_envelope["payload"]["topics"][0]["title"] == "T1"
+    # The id is a uuid4 (ADR-0005 §2) — not the LLM's ``topic-1``
+    # slug. Pin the id format rather than the value to keep the test
+    # stable across reruns.
+    import re as _re
+
+    assert _re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+        confirm_envelope["payload"]["topics"][0]["id"],
+    ), f"expected a uuid4 id, got {confirm_envelope['payload']['topics'][0]['id']!r}"
 
 
 def test_graph_failure_writes_failed_state_and_finalizes_the_stream(
@@ -996,8 +1139,16 @@ def test_real_main_graph_late_join_replays_plan_complete(monkeypatch, memory_che
     once and closes — a FINITE stream, which is exactly what
     ``TestClient`` can consume. This pins the manual-smoke shape as a
     test: late joiners see the stage result, not a silent close.
+
+    v0.3 adds the Plan→Research transition gate (ADR-0005, issue
+    #23) between ``plan_questioner`` and the research subgraph. The
+    test drives the gate resume directly via ``Command(resume=...)``
+    (no ``/confirm`` endpoint yet — issue #24) so the main graph can
+    advance through the gate into the research / write / finalize
+    stages and reach the ``"final"`` terminal.
     """
     from app.graph import build_graph
+    from app.models import ConfirmedResearchTopics
     from app.tools import llm, web_search
 
     topics_payload = {
@@ -1028,9 +1179,10 @@ def test_real_main_graph_late_join_replays_plan_complete(monkeypatch, memory_che
         ),
     }
 
-    # ready_to_proceed=true short-circuits the HITL loop (no interrupt at
-    # all — see plan.py): question-emit → topic-finalize → write, all in
-    # ONE invoke on the shared _StubChat queue.
+    # ready_to_proceed=true short-circuits the HITL loop (no questioner
+    # interrupt at all — see plan.py): question-emit → topic-finalize
+    # → GATE PAUSE. The main graph then needs the gate resume to
+    # advance into research / write / finalize.
     stub_chat = _StubChat(
         [
             json.dumps(
@@ -1064,8 +1216,26 @@ def test_real_main_graph_late_join_replays_plan_complete(monkeypatch, memory_che
 
     real_graph = build_graph(memory_checkpointer)
     thread_id = str(uuid.uuid4())
+    config = _build_config(thread_id)
+
+    # First invoke runs questioner (ready=true) → finalize → gate pause.
+    # The parent's ``values`` only carries ``user_query`` at this point
+    # — the plan subgraph's internal ``current_step`` / ``research_topics``
+    # live inside the subgraph, not at the parent. The gate's interrupt
+    # payload is reachable via ``tasks[0].interrupts[0].value``.
+    real_graph.invoke({"user_query": "Tell me about X"}, config=config)
+    paused_state = real_graph.get_state(config)
+    assert paused_state.next, "gate must be paused (next non-empty)"
+
+    # Drive the gate resume directly — no /confirm endpoint yet. The
+    # test accepts the LLM draft unchanged so the diff is empty and
+    # the test stays focused on the late-join SSE replay contract.
+    from langgraph.types import Command
+
+    gate_payload = paused_state.tasks[0].interrupts[0].value
     final_state = real_graph.invoke(
-        {"user_query": "Tell me about X"}, config=_build_config(thread_id)
+        Command(resume=ConfirmedResearchTopics(topics=list(gate_payload.topics))),
+        config=config,
     )
     assert final_state["current_step"] == "final"
 
@@ -1082,8 +1252,11 @@ def test_real_main_graph_late_join_replays_plan_complete(monkeypatch, memory_che
     assert [e["event"] for e in events] == ["plan_complete"]
     assert events[0]["data"]["thread_id"] == thread_id
     topics = events[0]["data"]["payload"]["research_topics"]
-    assert [t["id"] for t in topics] == ["topic-1", "topic-2"]
-    assert topics[0]["title"] == "History"
+    # v0.3 — the ids are uuid4 by ADR-0005 §2 (gate assigns them, not
+    # the LLM). The test pins the human-visible shape (titles in
+    # draft order) rather than the LLM's ``topic-1``/``topic-2``
+    # slugs so the assertion stays stable.
+    assert [t["title"] for t in topics] == ["History", "Current state"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

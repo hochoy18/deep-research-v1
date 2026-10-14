@@ -1,13 +1,34 @@
-"""Case example — Plan HITL loop with a real LLM and popup dialogs (issue #12).
+"""Case example — Plan HITL loop with a real LLM and popup dialogs (issue #12),
+plus the Plan→Research transition gate round-trip (issue #23).
 
 Builds the plan subgraph standalone and drives it through the real
 LangGraph interrupt / resume loop. The questioner LLM is a live
-``get_chat_model()`` instance, not a stub. On every interrupt the
-example prints the typed ``PlanInterruptPayload`` and pops a GUI
-dialog for each question; the user's typed answer is wrapped in a
-``PlanAnswerBatch`` and resumed via ``Command(resume=...)``. The
-loop exits as soon as the questioner sets ``ready_to_proceed=true``
-(or the 5-round soft cap is hit) and prints the final ``research_topics``.
+``get_chat_model()`` instance, not a stub. On every questioner
+interrupt the example prints the typed ``PlanInterruptPayload`` and
+pops a GUI dialog for each question; the user's typed answer is
+wrapped in a ``PlanAnswerBatch`` and resumed via ``Command(resume=...)``.
+The loop exits as soon as the questioner sets ``ready_to_proceed=true``
+(or the 5-round soft cap is hit) and the plan_questioner node
+materialises the topics.
+
+v0.3 (issue #23) inserts the Plan→Research transition gate between
+``plan_questioner`` and ``END``. After the topics are finalised the
+gate reads them, emits a typed ``PlanConfirmInterruptPayload``, and
+pauses. The example then prints the draft and pops a console prompt
+that lets the user choose between three scripted edit shapes:
+
+- **accept** — send the draft back unchanged (the diff is empty;
+  the gate writes ``confirmed_research_plan`` and ``plan_edit_diff``
+  as zeros and the subgraph reaches ``END``).
+- **delete one topic** — drop the topic with the given 1-based
+  index from the draft; the gate records a ``removed`` entry.
+- **modify one topic** — change the ``title`` of the topic with
+  the given 1-based index; the gate records a ``modified`` entry.
+
+After the resume the example prints the resulting
+``PlanEditDiff`` (or its absence, if the user accepted unchanged)
+and the final ``current_step`` / ``confirmed_research_plan`` it
+persists.
 
 Run it as a script::
 
@@ -38,7 +59,12 @@ from langgraph.types import Command
 from rich import print as rprint
 
 from app.graph.subgraphs.plan import build_plan_subgraph
-from app.models import PlanAnswerBatch, PlanUserAnswer
+from app.models import (
+    ConfirmedResearchTopics,
+    PlanAnswerBatch,
+    PlanUserAnswer,
+    ResearchTopic,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The user query this example drives. The LLM sees this verbatim as the
@@ -249,6 +275,97 @@ def _print_interrupt(round_label: str, interrupt_value) -> None:
         print()
 
 
+def _print_gate_interrupt(payload) -> None:
+    """Pretty-print a ``PlanConfirmInterruptPayload`` (gate, v0.3 — issue #23)."""
+    rprint(
+        f"\n[cyan]Gate[/cyan] (reasoning={payload.reasoning!r}, "
+        f"{len(payload.topics)} topic(s) proposed)"
+    )
+    for idx, topic in enumerate(payload.topics, start=1):
+        rprint(
+            f"  [{idx}] {topic.id} — {topic.title} "
+            f"({topic.expected_finding_type})"
+        )
+        rprint(f"      {topic.description}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Gate prompt — three scripted edit shapes (issue #23 AC). Module-level so
+# tests can monkeypatch.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _prompt_gate_edit(
+    draft: list[ResearchTopic],
+) -> ConfirmedResearchTopics | None:
+    """Pop a console prompt that lets the user pick one of three edit shapes.
+
+    Returns a ``ConfirmedResearchTopics`` with the user's final list, or
+    ``None`` if the prompt is unavailable (non-interactive shell). The
+    shape is intentionally scripted — the case example is meant to
+    exercise the gate round-trip, not to surface a fully-fledged editor.
+    """
+    try:
+        choice = input(
+            "\n[gate] accept / delete <i> / modify <i> / list (default=accept): "
+        ).strip()
+    except EOFError:
+        return None
+
+    parts = choice.split()
+    if not parts or parts[0] == "accept":
+        return ConfirmedResearchTopics(topics=list(draft))
+    if parts[0] == "list":
+        for idx, t in enumerate(draft, start=1):
+            print(f"  [{idx}] {t.id} — {t.title}")
+        return _prompt_gate_edit(draft)
+    if parts[0] == "delete" and len(parts) == 2 and parts[1].isdigit():
+        i = int(parts[1]) - 1
+        if not 0 <= i < len(draft):
+            print(f"  index out of range (1..{len(draft)})")
+            return _prompt_gate_edit(draft)
+        final = [t for j, t in enumerate(draft) if j != i]
+        return ConfirmedResearchTopics(topics=final)
+    if parts[0] == "modify" and len(parts) == 2 and parts[1].isdigit():
+        i = int(parts[1]) - 1
+        if not 0 <= i < len(draft):
+            print(f"  index out of range (1..{len(draft)})")
+            return _prompt_gate_edit(draft)
+        new_title = input(f"  new title for [{i + 1}] (was {draft[i].title!r}): ").strip()
+        if not new_title:
+            new_title = draft[i].title
+        final = list(draft)
+        final[i] = ResearchTopic(
+            id=draft[i].id,
+            title=new_title,
+            description=draft[i].description,
+            expected_finding_type=draft[i].expected_finding_type,
+        )
+        return ConfirmedResearchTopics(topics=final)
+    print(f"  unrecognised choice {choice!r}; please retry")
+    return _prompt_gate_edit(draft)
+
+
+def _print_final_diff(diff) -> None:
+    """Pretty-print the gate's ``PlanEditDiff`` (or 'no edits')."""
+    if diff.added or diff.removed or diff.modified:
+        rprint("\n[green]Plan edit diff:[/green]")
+    if diff.added:
+        rprint(f"  [+] added ({len(diff.added)}):")
+        for t in diff.added:
+            rprint(f"      - {t.id} — {t.title}")
+    if diff.removed:
+        rprint(f"  [-] removed ({len(diff.removed)}):")
+        for tid in diff.removed:
+            rprint(f"      - {tid}")
+    if diff.modified:
+        rprint(f"  [~] modified ({len(diff.modified)}):")
+        for entry in diff.modified:
+            rprint(f"      - {entry.id}: {entry.before.title!r} → {entry.after.title!r}")
+    if not (diff.added or diff.removed or diff.modified):
+        rprint("\n[green]Plan edit diff: (no edits — user accepted the draft)[/green]")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Driver — invoke the subgraph, pop dialogs, resume until finalize.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -266,16 +383,39 @@ def _run_hitl_demo() -> None:
     round_num = 1
     result = graph.invoke({"user_query": USER_QUERY}, config=config)
 
-    # Loop until the questioner says ready_to_proceed (or the soft cap
-    # forces the topic-finalize LLM). Each iteration is one full
-    # round: question-emit → interrupt → user answers → resume.
+    # Phase 1 — drive the questioner loop until ready_to_proceed (or
+    # the soft cap forces topic-finalize). Each iteration is one
+    # full round: question-emit → interrupt → user answers → resume.
+    # The interrupt value is always a ``PlanInterruptPayload`` here.
     while "__interrupt__" in result:
         interrupt_value = result["__interrupt__"][0].value
+        # Phase 2 — once the questioner finalizes, the next interrupt
+        # is the gate's ``PlanConfirmInterruptPayload``. Branch by
+        # payload type so the driver knows whether to pop a question
+        # dialog or a topic-edit prompt.
+        if not _is_questioner_interrupt(interrupt_value):
+            break
         _print_interrupt(f"Round {round_num} interrupt", interrupt_value)
         answers = _collect_answers(interrupt_value.questions)
         answer_batch = PlanAnswerBatch(round=round_num, answers=answers)
         result = graph.invoke(Command(resume=answer_batch), config=config)
         round_num += 1
+
+    # Phase 2 — drive the Plan→Research transition gate. The questioner
+    # either said ready_to_proceed (and the gate now pauses) or the
+    # soft cap fired topic-finalize (and the gate pauses). Either way
+    # the next ``__interrupt__`` is the gate's typed payload.
+    if "__interrupt__" in result:
+        gate_payload = result["__interrupt__"][0].value
+        _print_gate_interrupt(gate_payload)
+        confirmed = _prompt_gate_edit(list(gate_payload.topics))
+        if confirmed is None:
+            rprint(
+                "\n[yellow]Gate: non-interactive shell — accepting the "
+                "draft unchanged.[/yellow]"
+            )
+            confirmed = ConfirmedResearchTopics(topics=list(gate_payload.topics))
+        result = graph.invoke(Command(resume=confirmed), config=config)
 
     rprint("\n[green]Plan completed.[/green]")
     rprint(f"[green]current_step:[/green] {result['current_step']}")
@@ -283,6 +423,33 @@ def _run_hitl_demo() -> None:
     rprint("[green]research_topics:[/green]")
     for topic in result["research_topics"]:
         rprint(f"  - {topic.id}: {topic.title} — {topic.description}")
+
+    # Phase 3 — print the gate's audit trail if the gate ran. The
+    # ``plan_edit_diff`` field is on the state only after the gate
+    # confirmed; ``confirmed_research_plan`` carries the user's
+    # final list.
+    diff = result.get("plan_edit_diff")
+    if diff is not None:
+        _print_final_diff(diff)
+    confirmed_plan = result.get("confirmed_research_plan")
+    if confirmed_plan is not None:
+        rprint("\n[green]confirmed_research_plan:[/green]")
+        for topic in confirmed_plan:
+            rprint(f"  - {topic.id}: {topic.title}")
+
+
+def _is_questioner_interrupt(value: Any) -> bool:
+    """True if ``value`` is a questioner ``PlanInterruptPayload`` (not the gate).
+
+    Two interrupt types share the same channel in v0.3: the questioner
+    emits ``PlanInterruptPayload`` (carrying questions) and the gate
+    emits ``PlanConfirmInterruptPayload`` (carrying topics). The
+    discriminator is the presence of a ``topics`` field — see
+    ``app.api.events._is_gate_interrupt_value`` for the same check on
+    the SSE side. Re-implemented here to keep the example
+    self-contained (it doesn't depend on the API layer).
+    """
+    return hasattr(value, "questions") and not hasattr(value, "topics")
 
 
 if __name__ == "__main__":
